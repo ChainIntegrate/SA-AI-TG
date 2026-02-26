@@ -1,0 +1,40 @@
+ci-sales-agent/
+  README.md
+  package.json
+  .env.example
+  .gitignore
+
+  src/
+    index.js
+    config.js
+
+    telegram/
+      bot.js
+      commands.js
+      templates.js
+
+    core/
+      state.js
+      pipeline.js
+      memory.js
+      followup.js
+
+    services/
+      db.js
+      search.js
+      companyAnalyzer.js
+      llm.js
+
+    prompts/
+      system.js
+      sales.js
+
+    utils/
+      text.js
+      time.js
+      validate.js
+
+  data/
+    ci_sales.sqlite
+    backups/
+    logs/
