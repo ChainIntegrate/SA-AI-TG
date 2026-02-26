@@ -1,0 +1,84 @@
+CI SALES AGENT — PUNTI FISSI (definiti)
+
+Obiettivo
+- Agente commerciale attivo per ChainIntegrate, fase pre-incontro: trovare aziende, presentarsi, iterare messaggio, memorizzare evoluzioni e chiedere follow-up.
+- NON duplicare UI tecniche (certificati/PDF): focus commerciale.
+
+Interfaccia
+- Solo Telegram (no web UI necessaria).
+
+Paese e target
+- Paese: Italia.
+- Target primario: potenziali utilizzatori blockchain (non ultra-spinti sulla tracciabilità ma neanche a zero interesse).
+- Segmenti ideali: PMI manifatturiere/export, ISO presenti, segnali qualità/filiera/sostenibilità.
+
+Canali
+- Primario: LinkedIn DM.
+- Email ammessa come alternativa/secondo step.
+
+Stile e posizionamento
+- Profilo: C + un po’ D:
+  C) Partner Qualità / Audit
+  D) Soluzione concreta pronta (non consulenza teorica)
+- Regole comunicative:
+  - NON aprire mai con “blockchain”.
+  - Niente buzzword crypto/web3.
+  - Sempre: osservazione reale dall’azienda + problema audit/documenti + soluzione sintetica + CTA minima (15 min).
+  - Tono industriale, pragmatico, credibile.
+
+Modalità operative (C)
+- L’agente deve lavorare in 2 modalità:
+  1) Ricerca su richiesta (/cerca ...): avvia una ricerca autonoma quando glielo chiedi.
+  2) Analisi su URL passato da te (/analizza <url>): azienda fornita dall’utente.
+
+Iterazione
+- L’agente propone 1 azienda alla volta + strategia di contatto + bozza messaggio.
+- Tu puoi correggere e l’agente deve adattarsi alle correzioni.
+- Quando dici “OK” (/ok): finalizza e produce il testo pronto copia/incolla.
+
+Esecuzione (scelta A)
+- “Eseguire” = generare il messaggio finale pronto.
+- Non invio automatico (per ora). L’utente invia manualmente.
+- Però l’agente salva “messaggio inviato” e aggiorna la pipeline.
+
+Memoria e CRM leggero
+- Deve tenere memoria delle conversazioni e delle evoluzioni per ogni azienda/contatto:
+  - azienda, link, segnali, ruolo target, strategia, messaggio inviato, note
+  - stato pipeline: Da contattare / Contattato / Ha risposto / Call fissata / In trattativa / Perso / Chiuso
+- Deve evitare ripetizioni inutili e ricalibrare in base ai feedback.
+
+Follow-up proattivo
+- Dopo che uno stato diventa “Contattato”, l’agente deve chiedere come sta andando.
+- Follow-up automatico dopo N giorni (default 5, configurabile).
+- Deve memorizzare la risposta (nessuna risposta / risposta / call fissata / archivia) e proporre follow-up message se serve.
+
+Ruolo target dinamico (E)
+- Il ruolo target NON è fisso: dipende dall’azienda.
+- Logica base:
+  - 10–40 dip: CEO/Titolare
+  - 40–120 dip: Responsabile Qualità (default), alternativa Operations
+  - segnali ESG: Sustainability/ESG
+  - automotive/filiera: Qualità/Supply Chain
+- L’agente deve sempre motivare la scelta del ruolo target.
+
+Metriche e miglioramento
+- L’agente deve imparare nel tempo:
+  - settori che rispondono di più
+  - dimensioni più reattive
+  - ruolo target più efficace
+  - hook migliori
+- Deve poter restituire insight dopo un po’ di contatti.
+
+Comandi Telegram minimi
+- /cerca <query>
+- /analizza <url>
+- /prossima
+- /approva
+- /ok
+- /stato <azienda> <fase>
+- /nota <azienda> <testo>
+- /storico <azienda>
+- /pipeline
+- /filtri set key=value ...
+- /followup giorni N
+- /check (contatti in sospeso oggi)
