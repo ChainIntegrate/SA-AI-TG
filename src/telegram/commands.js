@@ -28,6 +28,19 @@ Comandi:
 - /pipeline
 - /filtri set key=value ...`);
 
+          case "/webhook": {
+      // Imposta o mostra info webhook
+      const { tgSetWebhook, tgGetWebhookInfo } = await import("./templates.js");
+
+      if (parsed.args?.toLowerCase() === "info") {
+        const info = await tgGetWebhookInfo(cfg);
+        return tgSend(cfg, chatId, `Webhook info:\n${JSON.stringify(info, null, 2)}`);
+      }
+
+      const resp = await tgSetWebhook(cfg);
+      return tgSend(cfg, chatId, `Webhook impostato ✅\n${JSON.stringify(resp, null, 2)}`);
+    }
+
     case "/filtri": {
       if (!parsed.args.startsWith("set ")) {
         return tgSend(cfg, chatId, `Filtri attuali:\n${JSON.stringify(prefs, null, 2)}`);
