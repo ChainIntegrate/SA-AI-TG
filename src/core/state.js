@@ -25,6 +25,13 @@ function defaultPrefs() {
     minDip: 30,
     maxDip: 120,
     esclusioni: [],
-    lastDraftMessage: null
+    lastDraftMessage: null,
+
+     // NEW
+    uiMode: "dialog",         // "dialog" oppure "console"
+    flowState: "IDLE",        // stato conversazione
+    flowContext: {},          // contesto (queue, last company, scelte)
+    lastSearchQueue: [],
+    lastSearchQuery: ""
   };
 }

@@ -2,4 +2,8 @@ node_modules/
 data/*.sqlite
 data/backups/
 data/logs/
+data/
 .env
+# opzionale ma consigliato:
+*.log
+.DS_Store

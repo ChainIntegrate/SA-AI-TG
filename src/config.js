@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 export function loadConfig() {
-  const PORT = Number(process.env.PORT || "8080");
+  const PORT = Number(process.env.PORT || "3000");
   const BASE_URL = String(process.env.BASE_URL || "");
   const WEBHOOK_PATH = String(process.env.WEBHOOK_PATH || "/tg/webhook");
   const TG_SECRET = String(process.env.TG_SECRET || "");
@@ -23,14 +23,22 @@ export function loadConfig() {
   const LLM_MODEL = String(process.env.LLM_MODEL || "");
 
   const SEARCH_PROVIDER = String(process.env.SEARCH_PROVIDER || "none");
+  // supporto esplicito Brave
+  const BRAVE_API_KEY = String(process.env.BRAVE_API_KEY || "");
+  // opzionale se in futuro avrai altri provider
   const SEARCH_API_KEY = String(process.env.SEARCH_API_KEY || "");
 
   return {
     PORT, BASE_URL, WEBHOOK_PATH, TG_SECRET,
     TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS,
     DB_PATH,
+
     FOLLOWUP_DAYS_DEFAULT, FOLLOWUP_CHECK_CRON,
+
     LLM_PROVIDER, LLM_API_KEY, LLM_MODEL,
-    SEARCH_PROVIDER, SEARCH_API_KEY
+
+    SEARCH_PROVIDER,
+    BRAVE_API_KEY,
+    SEARCH_API_KEY
   };
 }
