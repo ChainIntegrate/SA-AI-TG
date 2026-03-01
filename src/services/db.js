@@ -9,6 +9,7 @@ export function initDb(dbPath) {
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
 
+  // 1) base schema (create if not exists)
   db.exec(`
 CREATE TABLE IF NOT EXISTS user_prefs (
   chat_id TEXT PRIMARY KEY,
@@ -64,7 +65,39 @@ CREATE TABLE IF NOT EXISTS notes (
 CREATE INDEX IF NOT EXISTS idx_companies_chat ON companies(chat_id);
 CREATE INDEX IF NOT EXISTS idx_deals_chat ON deals(chat_id);
 CREATE INDEX IF NOT EXISTS idx_deals_followup ON deals(chat_id, next_followup_at);
+CREATE INDEX IF NOT EXISTS idx_messages_deal ON messages(deal_id);
+CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id);
   `);
 
+  // 2) migrations (ALTER TABLE add columns if missing)
+  migrate(db);
+
   return db;
+}
+
+/* --------------------------- migrations --------------------------- */
+
+function migrate(db) {
+  // messages: channel/contact (per mostrare “punto di contatto” in pipeline)
+  ensureColumn(db, "messages", "channel", "TEXT");
+  ensureColumn(db, "messages", "contact", "TEXT");
+
+  // companies: dove salvare contatto trovato da ricerca/AI (prima dell’outbound)
+  // lo teniamo come JSON, così può contenere più campi (name/role/url/email/evidence_ref/confidence)
+  ensureColumn(db, "companies", "contact_hint_json", "TEXT");
+
+  // indici aggiuntivi utili
+  db.exec(`
+CREATE INDEX IF NOT EXISTS idx_messages_dir ON messages(direction);
+CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+  `);
+}
+
+function ensureColumn(db, table, column, ddlType) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  const exists = (cols || []).some((c) => String(c.name).toLowerCase() === String(column).toLowerCase());
+  if (exists) return;
+
+  // ALTER TABLE safe
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddlType}`);
 }
