@@ -111,6 +111,12 @@ VALUES(?,?,?,?,?,?,?,?,?,?)
 
     // ✅ NEW: contact hint for Telegram UI
     contactHint,
+
+      // ✅ NEW: raw evidence snippets (for rich Telegram output)
+    evidenceItems: Array.isArray(searchPack?.items) ? searchPack.items : [],
+    evidenceQuery: searchPack?.query || null,
+    sourceUrls: Array.isArray(searchPack?.sourceUrls) ? searchPack.sourceUrls : [],
+    
   };
 }
 
@@ -619,6 +625,85 @@ Possiamo sentirci 10-15 minuti questa settimana?
     .slice(0, 8);
 
   return a;
+}
+
+export async function draftOutboundWithLLM({ cfg, company, channel = "LinkedIn" }) {
+  if (!company?.analysis) throw new Error("Missing company.analysis for drafting");
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      drafts: {
+        type: "array",
+        minItems: 2,
+        maxItems: 3,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            id: { type: "string", enum: ["1", "2", "3"] },
+            angle: { type: "string" }, // audit / docs / verify
+            tone: { type: "string" },  // diretto / bilanciato / formale
+            text: { type: "string" }   // 5-9 righe
+          },
+          required: ["id", "angle", "tone", "text"]
+        }
+      },
+      suggested_channel: { type: "string", enum: ["LinkedIn", "Email"] },
+      followup_question: { type: "string" }
+    },
+    required: ["drafts", "suggested_channel", "followup_question"]
+  };
+
+  const a = company.analysis;
+  const ev = Array.isArray(a.evidence_map) ? a.evidence_map : [];
+
+  const system = `
+Sei una sales assistant B2B per ChainIntegrate (qualità/tracciabilità).
+
+REGOLE DURE:
+1) Non inventare nulla: usa SOLO i claim presenti in evidence_map.
+2) Vietato "blockchain" nel primo messaggio.
+3) Vietati placeholder (es: [Nome], <azienda>, ecc.).
+4) 5-9 righe max, professionale, non spam.
+5) Chiudi con CTA: call 10-15 minuti.
+
+Genera 2-3 varianti con angoli diversi:
+- audit/tempi e attriti
+- versioni documenti / errori / duplicazioni
+- verifica per clienti esteri / accesso verificabile (QR solo se serve, senza insistere)
+`.trim();
+
+  const input = `
+CHANNEL: ${channel}
+COMPANY: ${company.name}
+WEBSITE: ${company.website}
+
+EVIDENCE_MAP (usa solo questi claim):
+${ev.map((x, i) => `- (${x.evidence_ref || "#" + (i + 1)}) ${x.claim}`).join("\n")}
+`.trim();
+
+  const out = await llmJSON({
+    input,
+    system,
+    schema,
+    model: cfg.LLM_MODEL || undefined,
+    temperature: 0.4,
+    maxOutputTokens: 700,
+    metadata: { feature: "outbound_draft", company: company.name, channel }
+  });
+
+  // normalizzazione minima
+  const data = out.data || {};
+  data.drafts = (Array.isArray(data.drafts) ? data.drafts : []).slice(0, 3).map((d, idx) => ({
+    id: String(d?.id || String(idx + 1)),
+    angle: String(d?.angle || "").trim().slice(0, 80),
+    tone: String(d?.tone || "").trim().slice(0, 80),
+    text: String(d?.text || "").trim().slice(0, 1400),
+  }));
+
+  return data;
 }
 
 function addCompanyFallback({ cfg, db, chatId, url, prefs, baseName }) {

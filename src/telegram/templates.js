@@ -19,6 +19,13 @@ async function tgApiCall(cfg, method, payload) {
   return j;
 }
 
+export async function tgAction(cfg, chatId, action = "typing") {
+  return tgApiCall(cfg, "sendChatAction", {
+    chat_id: chatId,
+    action, // "typing" | "upload_document" | "upload_photo" | ecc.
+  });
+}
+
 export async function tgSend(cfg, chatId, text, opts = {}) {
   // Telegram max message length ~4096. Facciamo chunking pulito.
   const chunks = splitTelegram(text, 3800);

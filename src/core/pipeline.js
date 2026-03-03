@@ -263,3 +263,134 @@ LIMIT 50
 
   return rows || [];
 }
+
+// --- DB CLEANUP HELPERS ---
+
+function q(db, sql, params = []) {
+  return db.prepare(sql).run(...params);
+}
+function all(db, sql, params = []) {
+  return db.prepare(sql).all(...params);
+}
+function get(db, sql, params = []) {
+  return db.prepare(sql).get(...params);
+}
+
+/**
+ * Cancella TUTTO per chatId (companies/deals/messages/notes) in modo consistente.
+ * Ordine: messages -> notes -> deals -> companies.
+ */
+export function purgeAllForChat({ db, chatId }) {
+  const cid = String(chatId);
+
+  const tx = db.transaction(() => {
+    q(db, `DELETE FROM messages WHERE chat_id=?`, [cid]);
+    q(db, `DELETE FROM notes    WHERE chat_id=?`, [cid]);
+    q(db, `DELETE FROM deals    WHERE chat_id=?`, [cid]);
+    q(db, `DELETE FROM companies WHERE chat_id=?`, [cid]);
+  });
+
+  tx();
+  return true;
+}
+
+/**
+ * Pulizia selettiva per chatId.
+ * flags: { messages?: boolean, notes?: boolean, deals?: boolean, companies?: boolean }
+ * Nota: se cancelli companies, prima cancella deals/messages/notes.
+ */
+export function purgeForChat({ db, chatId, flags }) {
+  const cid = String(chatId);
+
+  const tx = db.transaction(() => {
+    if (flags?.messages) q(db, `DELETE FROM messages WHERE chat_id=?`, [cid]);
+    if (flags?.notes)    q(db, `DELETE FROM notes    WHERE chat_id=?`, [cid]);
+    if (flags?.deals)    q(db, `DELETE FROM deals    WHERE chat_id=?`, [cid]);
+    if (flags?.companies) q(db, `DELETE FROM companies WHERE chat_id=?`, [cid]);
+  });
+
+  tx();
+  return true;
+}
+
+/**
+ * Cancella una singola azienda (per nome) + tutto lo storico collegato.
+ * Prende l'azienda più recente con quel nome per il chatId.
+ */
+export function deleteCompanyCascade({ db, chatId, companyName }) {
+  const cid = String(chatId);
+  const name = String(companyName || "").trim();
+  if (!name) return { ok: false, reason: "missing_name" };
+
+  const c = get(
+    db,
+    `SELECT id, name FROM companies WHERE chat_id=? AND name=? ORDER BY id DESC LIMIT 1`,
+    [cid, name]
+  );
+  if (!c) return { ok: false, reason: "not_found" };
+
+  const tx = db.transaction(() => {
+    // trova deals della company
+    const deals = all(db, `SELECT id FROM deals WHERE chat_id=? AND company_id=?`, [cid, c.id]);
+    const dealIds = deals.map(d => d.id);
+
+    // cancella messages per quei deals
+    if (dealIds.length) {
+      // costruisci IN (?, ?, ...)
+      const ph = dealIds.map(() => "?").join(",");
+      q(db, `DELETE FROM messages WHERE chat_id=? AND deal_id IN (${ph})`, [cid, ...dealIds]);
+    }
+
+    // cancella notes per company
+    q(db, `DELETE FROM notes WHERE chat_id=? AND company_id=?`, [cid, c.id]);
+
+    // cancella deals
+    q(db, `DELETE FROM deals WHERE chat_id=? AND company_id=?`, [cid, c.id]);
+
+    // cancella company
+    q(db, `DELETE FROM companies WHERE chat_id=? AND id=?`, [cid, c.id]);
+  });
+
+  tx();
+  return { ok: true, deletedCompanyId: c.id, deletedCompanyName: c.name };
+}
+
+/**
+ * Garbage collection: tieni solo gli ultimi N deals (per chatId), cancella il resto a cascata.
+ */
+export function pruneDealsKeepLastN({ db, chatId, keep = 50 }) {
+  const cid = String(chatId);
+  const k = Math.max(0, Number(keep) || 0);
+
+  const tx = db.transaction(() => {
+    const keepIds = all(
+      db,
+      `SELECT id FROM deals WHERE chat_id=? ORDER BY id DESC LIMIT ?`,
+      [cid, k]
+    ).map(r => r.id);
+
+    // se nulla da tenere, purge all deals+messages (non companies)
+    if (!keepIds.length) {
+      q(db, `DELETE FROM messages WHERE chat_id=?`, [cid]);
+      q(db, `DELETE FROM deals WHERE chat_id=?`, [cid]);
+      return;
+    }
+
+    const ph = keepIds.map(() => "?").join(",");
+    // cancella messages dei deals NON in keep
+    q(
+      db,
+      `DELETE FROM messages WHERE chat_id=? AND deal_id NOT IN (${ph})`,
+      [cid, ...keepIds]
+    );
+    // cancella deals NON in keep
+    q(
+      db,
+      `DELETE FROM deals WHERE chat_id=? AND id NOT IN (${ph})`,
+      [cid, ...keepIds]
+    );
+  });
+
+  tx();
+  return true;
+}

@@ -1,21 +1,46 @@
 // src/telegram/commands.js
-import { tgSend } from "./templates.js";
+import { tgSend, tgAction } from "./templates.js";
 import { upsertUserPrefs, getUserPrefs } from "../core/state.js";
-import { addCompanyFromUrl, proposeNextCompany } from "../services/companyAnalyzer.js";
+import { addCompanyFromUrl, proposeNextCompany, draftOutboundWithLLM } from "../services/companyAnalyzer.js";
 import {
   createDealForCompany,
   setDealStage,
   addNote,
   listPipeline,
   recordOutboundMessage,
+  purgeAllForChat,
+  purgeForChat,
+  deleteCompanyCascade,
+  pruneDealsKeepLastN,
 } from "../core/pipeline.js";
 import { searchWeb } from "../services/search.js";
+
+
 
 export function parseCommand(text) {
   const t = String(text || "").trim();
   if (!t.startsWith("/")) return { cmd: "free", args: t };
   const [head, ...rest] = t.split(" ");
   return { cmd: head.toLowerCase(), args: rest.join(" ").trim() };
+}
+
+// ✅ ADD THIS (top-level)
+async function withTyping(cfg, chatId, fn) {
+  let stop = false;
+
+  const loop = (async () => {
+    while (!stop) {
+      try { await tgAction(cfg, chatId, "typing"); } catch {}
+      await new Promise((r) => setTimeout(r, 3500));
+    }
+  })();
+
+  try {
+    return await fn();
+  } finally {
+    stop = true;
+    await loop.catch(() => {});
+  }
 }
 
 function normalizeCandidates(resultsObj, limit = 8) {
@@ -58,35 +83,101 @@ function getFlow(db, chatId) {
   };
 }
 
+function renderDraftChoices(draftPack) {
+  const drafts = Array.isArray(draftPack?.drafts) ? draftPack.drafts : [];
+  const lines = [];
+
+  lines.push("Bozze AI pronte ✅");
+  lines.push("Scegli: 1 / 2 / 3");
+  lines.push("Oppure: RIGENERA  |  NO (salta)\n");
+
+  for (const d of drafts) {
+    lines.push(`(${d.id}) [${d.tone} | ${d.angle}]`);
+    lines.push(d.text);
+    lines.push("");
+  }
+
+  if (draftPack?.followup_question) {
+    lines.push(`Domanda rapida: ${draftPack.followup_question}`);
+  }
+
+  return lines.join("\n").trim();
+}
+
 function briefCompanyText(company, deal, remaining) {
-  const ev = Array.isArray(company?.analysis?.evidence_map)
-    ? company.analysis.evidence_map
-    : [];
-  const evTop = ev.slice(0, 2);
+  const a = company?.analysis || {};
 
-  const whyShort = evTop.length
-    ? evTop.map((x) => x.claim).join(" | ")
-    : (company.signals || []).slice(0, 2).join(", ") || "segnali qualità/filiera";
+  const signals = Array.isArray(company?.signals) ? company.signals : [];
+  const pains = Array.isArray(company?.painPoints) ? company.painPoints : [];
 
-  const angle = company.entryAngle || deal.entryAngle || "Audit/Qualità (no buzzword)";
+  const ev = Array.isArray(a?.evidence_map) ? a.evidence_map : [];
+  const evTop = ev.slice(0, 8);
 
-  const lines = [
-    `Azienda: ${company.name}`,
-    `Link: ${company.website || "-"}`,
-    `Perché lei: ${whyShort}`,
-    `Ruolo target: ${deal.roleTarget}`,
-    `Angolo: ${angle}`,
-    `La teniamo? (Sì/No)`,
-  ];
+  const conf = a?.confidence || {};
+  const ch = company?.contactHint || null;
 
+  const role = deal?.roleTarget || company?.roleTarget || "-";
+  const roleWhy = deal?.roleWhy || company?.roleWhy || "-";
+  const angle = company?.entryAngle || deal?.entryAngle || "-";
+
+  const lines = [];
+
+  // --- BLOCCO 1: profilo ---
+  lines.push(`Azienda: ${company?.name || "-"}`);
+  lines.push(`Link: ${company?.website || "-"}`);
+  lines.push(`Settore: ${company?.sector || "-"} | Paese: ${company?.country || "-"} | Size: ${company?.sizeEst || "-"}`);
+
+  const cm = typeof conf.company_match === "number" ? conf.company_match : "-";
+  const cs = typeof conf.sector === "number" ? conf.sector : "-";
+  const cz = typeof conf.size_est === "number" ? conf.size_est : "-";
+  lines.push(`Confidence: match ${cm} | settore ${cs} | size ${cz}`);
+
+  // contact hint
+  if (ch && ch.channel && ch.channel !== "NONE") {
+    if (ch.channel === "EMAIL") {
+      lines.push(`Contatto (hint): EMAIL ${ch.email || "-"} (ref ${ch.evidence_ref || "-"}) conf=${ch.confidence ?? "-"}`);
+    } else if (ch.channel === "LINKEDIN") {
+      lines.push(`Contatto (hint): LINKEDIN ${ch.url || "-"} (ref ${ch.evidence_ref || "-"}) conf=${ch.confidence ?? "-"}`);
+    }
+  } else {
+    lines.push(`Contatto (hint): non trovato`);
+  }
+
+  lines.push("");
+
+  // --- BLOCCO 2: strategia ---
+  lines.push(`Ruolo target: ${role}`);
+  lines.push(`Perché: ${roleWhy}`);
+  lines.push(`Angolo: ${angle}`);
+  if (company?.whyNow) lines.push(`Why now: ${company.whyNow}`);
+  if (company?.icebreaker) lines.push(`Icebreaker: ${company.icebreaker}`);
+
+  // segnali / pains
+  if (signals.length) {
+    lines.push("");
+    lines.push(`Segnali (top ${Math.min(signals.length, 10)}):`);
+    signals.slice(0, 10).forEach((s) => lines.push(`- ${s}`));
+  }
+
+  if (pains.length) {
+    lines.push("");
+    lines.push(`Pain points (top ${Math.min(pains.length, 8)}):`);
+    pains.slice(0, 8).forEach((p) => lines.push(`- ${p}`));
+  }
+
+  // evidence_map (più estesa)
+  if (evTop.length) {
+    lines.push("");
+    lines.push(`Fatti da snippet (${evTop.length}):`);
+    evTop.forEach((x) => lines.push(`- ${x.claim} (${x.evidence_ref})`));
+  }
+
+  lines.push("");
+  lines.push(`La teniamo? (Sì/No)`);
+  lines.push(`Extra: scrivi APRI per rimandare il link`);
   if (typeof remaining === "number") lines.push(`In coda: ${remaining}`);
 
-  const evLines = evTop.length
-    ? "\nFatti (da snippet):\n" +
-      evTop.map((x) => `- ${x.claim} (${x.evidence_ref})`).join("\n")
-    : "";
-
-  return lines.slice(0, 8).join("\n") + evLines;
+  return lines.join("\n");
 }
 
 function angleMenu() {
@@ -189,6 +280,83 @@ export async function handleCommand({ cfg, db, chatId, user, parsed }) {
   const prefs = getUserPrefs({ db, chatId });
 
   switch (parsed.cmd) {
+
+case "/db": {
+  const arg = String(parsed.args || "").trim();
+
+  // help
+  if (!arg || /^help$/i.test(arg)) {
+    return tgSend(
+      cfg,
+      chatId,
+      [
+        "🧹 Comandi DB:",
+        "/db purge_all               (RESET TOTALE per questo chatId)",
+        "/db purge messages|notes|deals|companies",
+        "/db del <nome_azienda>      (cancella azienda + storico)",
+        "/db prune <N>               (tieni ultimi N deals, cancella il resto)",
+        "",
+        "⚠️ Attenzione: purge_all è irreversibile.",
+      ].join("\n")
+    );
+  }
+
+  // reset totale
+  if (/^purge_all$/i.test(arg)) {
+    purgeAllForChat({ db, chatId });
+    // opzionale: azzera anche flow e lastDraft
+    upsertUserPrefs({ db, chatId, patch: { flowState: "IDLE", flowContext: {}, lastDraftMessage: null } });
+    return tgSend(cfg, chatId, "Fatto ✅ DB pulito (tutto) per questo chatId.");
+  }
+
+  // purge selettivo
+  if (/^purge\s+/i.test(arg)) {
+    const what = arg.replace(/^purge\s+/i, "").trim().toLowerCase();
+
+    const flags = {
+      messages: what === "messages",
+      notes: what === "notes",
+      deals: what === "deals",
+      companies: what === "companies",
+    };
+
+    if (!flags.messages && !flags.notes && !flags.deals && !flags.companies) {
+      return tgSend(cfg, chatId, "Uso: /db purge messages|notes|deals|companies");
+    }
+
+    // se chiedi companies ma non chiedi deals/messages/notes, li cancelliamo comunque prima per coerenza
+    if (flags.companies) {
+      purgeAllForChat({ db, chatId });
+      upsertUserPrefs({ db, chatId, patch: { flowState: "IDLE", flowContext: {}, lastDraftMessage: null } });
+      return tgSend(cfg, chatId, "Fatto ✅ cancellate companies (e cascata completa) per questo chatId.");
+    }
+
+    purgeForChat({ db, chatId, flags });
+    return tgSend(cfg, chatId, `Fatto ✅ purge ${what}.`);
+  }
+
+  // delete azienda
+  if (/^del\s+/i.test(arg)) {
+    const name = arg.replace(/^del\s+/i, "").trim();
+    const res = deleteCompanyCascade({ db, chatId, companyName: name });
+    if (!res.ok) {
+      if (res.reason === "not_found") return tgSend(cfg, chatId, `Non trovo "${name}" nel DB.`);
+      return tgSend(cfg, chatId, "Nome azienda mancante. Uso: /db del <nome_azienda>");
+    }
+    return tgSend(cfg, chatId, `Fatto ✅ eliminata: ${res.deletedCompanyName} (id ${res.deletedCompanyId}).`);
+  }
+
+  // prune
+  if (/^prune\s+/i.test(arg)) {
+    const n = Number(arg.replace(/^prune\s+/i, "").trim());
+    if (!Number.isFinite(n) || n < 0) return tgSend(cfg, chatId, "Uso: /db prune <N>  (es: /db prune 50)");
+    pruneDealsKeepLastN({ db, chatId, keep: n });
+    return tgSend(cfg, chatId, `Fatto ✅ tenuti ultimi ${n} deals (cancellato il resto).`);
+  }
+
+  return tgSend(cfg, chatId, "Comando non riconosciuto. Scrivi /db help.");
+}
+
     case "/modo": {
       const arg = (parsed.args || "").trim().toLowerCase();
       if (arg !== "dialogo" && arg !== "console") {
@@ -216,10 +384,10 @@ export async function handleCommand({ cfg, db, chatId, user, parsed }) {
     }
 
     case "/start":
-      return tgSend(
-        cfg,
-        chatId,
-        `Ciao! Sono CI Sales Agent.
+  return tgSend(
+    cfg,
+    chatId,
+    `Ciao! Sono CI Sales Agent.
 Comandi:
 - /cerca <query>
 - /analizza <url>
@@ -228,8 +396,9 @@ Comandi:
 - /stato <azienda> <fase>
 - /nota <azienda> <testo>
 - /pipeline
-- /filtri set key=value ...`
-      );
+- /filtri set key=value
+- /db help   (gestione e pulizia database)`
+  );
 
     case "/webhook": {
       const { tgSetWebhook, tgGetWebhookInfo } = await import("./templates.js");
@@ -435,26 +604,100 @@ Contatto: ${lastDraft.contact}`
     }
 
     case "/pipeline": {
+  const arg = String(parsed.args || "").trim();
+
+  // Se l'utente scrive: /pipeline 3  (o /pipeline nomeazienda...)
+  // apriamo direttamente il dettaglio
+  if (arg) {
+    const rows = listPipeline({ db, chatId });
+    if (!rows.length) return tgSend(cfg, chatId, "Pipeline vuota.");
+
+    // prova numero
+    const n = Number(arg);
+    let picked = null;
+
+    if (Number.isFinite(n) && n >= 1 && n <= rows.length) {
+      picked = rows[n - 1];
+    } else {
+      // fallback: match per nome (contains, case-insensitive)
+      const q = arg.toLowerCase();
+      picked = rows.find(r => String(r.companyName || "").toLowerCase().includes(q));
+    }
+
+    if (!picked) {
+      return tgSend(cfg, chatId, `Non trovo "${arg}". Usa /pipeline per vedere la lista e scegliere il numero.`);
+    }
+
+    // dettaglio “leggibile”
+    const stage = picked.stage || "-";
+    const role = picked.roleTarget || "-";
+    const why = picked.roleWhy || "-";
+    const ch = picked.channel || picked.lastOutboundChannel || "-";
+    const contact = picked.lastOutboundContact || "-";
+    const next = picked.nextFollowupAt || "-";
+    const lastAt = picked.lastOutboundAt || "-";
+    const msg = picked.lastOutboundText
+      ? String(picked.lastOutboundText).trim()
+      : "(nessun messaggio OUTBOUND salvato)";
+
+    const detail = [
+      `📌 *${picked.companyName}*`,
+      `Stato: ${stage}`,
+      `Canale: ${ch}`,
+      `Contatto: ${contact}`,
+      `Next followup: ${next}`,
+      "",
+      `Target: ${role}`,
+      `Perché: ${why}`,
+      "",
+      `Ultimo OUT (${lastAt}):`,
+      msg.length > 3500 ? msg.slice(0, 3500) + "…" : msg,
+    ].join("\n");
+
+    // se vuoi Markdown, abilita parse_mode e fai escaping.
+    return tgSend(cfg, chatId, detail);
+  }
+
+  // Step 1: elenco compatto + salvataggio “indice”
   const rows = listPipeline({ db, chatId });
   if (!rows.length) return tgSend(cfg, chatId, "Pipeline vuota.");
 
-  const out = rows.map((r) => {
+  // salva in flowContext la lista ordinata
+  setFlow(db, chatId, "PIPELINE_LIST", {
+    pipelineList: rows.map(r => ({
+      companyName: r.companyName,
+      stage: r.stage,
+      channel: r.channel,
+      nextFollowupAt: r.nextFollowupAt,
+      lastOutboundAt: r.lastOutboundAt,
+      lastOutboundChannel: r.lastOutboundChannel,
+      lastOutboundContact: r.lastOutboundContact,
+      lastOutboundText: r.lastOutboundText,
+      roleTarget: r.roleTarget,
+      roleWhy: r.roleWhy,
+    })),
+  });
+
+  // costruisci output “a tabella” ma compatto
+  const lines = [];
+  lines.push("📋 *Pipeline*");
+  lines.push("Rispondi con un numero per aprire il dettaglio (es: 3).");
+  lines.push("Oppure: /pipeline <numero>  |  /stop");
+  lines.push("");
+
+  rows.slice(0, 30).forEach((r, i) => {
+    const idx = i + 1;
     const stage = r.stage || "-";
     const ch = r.channel || r.lastOutboundChannel || "-";
-    const role = r.roleTarget ? ` | target: ${r.roleTarget}` : "";
-    const next = ` | next: ${r.nextFollowupAt || "-"}`;
+    const contact = r.lastOutboundContact ? ` · ${r.lastOutboundContact}` : "";
+    const next = r.nextFollowupAt ? ` · next ${r.nextFollowupAt}` : "";
+    const last = r.lastOutboundAt ? ` · last ${r.lastOutboundAt}` : "";
+    lines.push(`${idx}) ${r.companyName} — ${stage} — ${ch}${contact}${next}${last}`);
+  });
 
-    const contact = r.lastOutboundContact ? ` | contatto: ${r.lastOutboundContact}` : "";
+  if (rows.length > 30) lines.push(`\n(visualizzate 30 su ${rows.length})`);
 
-    const lastAt = r.lastOutboundAt ? ` | last OUT: ${r.lastOutboundAt}` : "";
-    const preview = r.lastOutboundText
-      ? `\n  ↳ "${String(r.lastOutboundText).replace(/\s+/g, " ").trim().slice(0, 140)}${String(r.lastOutboundText).length > 140 ? "…" : ""}"`
-      : "";
-
-    return `- ${r.companyName} | ${stage} | ch: ${ch}${role}${contact}${next}${lastAt}${preview}`;
-  }).join("\n");
-
-  return tgSend(cfg, chatId, `Pipeline:\n${out}`);
+  return tgSend(cfg, chatId, lines.join("\n"));
 }
 
     case "free":
@@ -467,6 +710,48 @@ Contatto: ${lastDraft.contact}`
       if (!hasActiveFlow && uiMode !== "dialog") {
         return tgSend(cfg, chatId, "Ok. Usa /cerca oppure /analizza.");
       }
+
+      // PIPELINE_LIST: l'utente risponde "3" e apriamo quel record
+if (flowState === "PIPELINE_LIST") {
+  const list = Array.isArray(flowContext.pipelineList) ? flowContext.pipelineList : [];
+  const n = Number(txt);
+
+  if (!Number.isFinite(n) || n < 1 || n > list.length) {
+    return tgSend(cfg, chatId, "Scrivi un numero valido della lista (es: 1, 2, 3) oppure /stop.");
+  }
+
+  const picked = list[n - 1];
+
+  // chiudi flow
+  setFlow(db, chatId, "IDLE", {});
+
+  // riusa la stessa vista dettaglio del /pipeline <arg>
+  // (qui la ricostruiamo inline)
+  const stage = picked.stage || "-";
+  const ch = picked.channel || picked.lastOutboundChannel || "-";
+  const contact = picked.lastOutboundContact || "-";
+  const next = picked.nextFollowupAt || "-";
+  const lastAt = picked.lastOutboundAt || "-";
+  const role = picked.roleTarget || "-";
+  const why = picked.roleWhy || "-";
+  const msg = picked.lastOutboundText ? String(picked.lastOutboundText).trim() : "(nessun OUTBOUND)";
+
+  const detail = [
+    `📌 *${picked.companyName}*`,
+    `Stato: ${stage}`,
+    `Canale: ${ch}`,
+    `Contatto: ${contact}`,
+    `Next followup: ${next}`,
+    "",
+    `Target: ${role}`,
+    `Perché: ${why}`,
+    "",
+    `Ultimo OUT (${lastAt}):`,
+    msg.length > 3500 ? msg.slice(0, 3500) + "…" : msg,
+  ].join("\n");
+
+  return tgSend(cfg, chatId, detail);
+}
 
       // shortcut: "cerca ..."
       if (flowState === "IDLE" && /^cerca\b/i.test(txt)) {
@@ -499,18 +784,21 @@ Contatto: ${lastDraft.contact}`
         }
 
         if (/^s[iì]$/i.test(txt) || /^si$/i.test(txt)) {
-          const company = await addCompanyFromUrl({ cfg, db, chatId, url: cand.url });
+          const company = await withTyping(cfg, chatId, () =>
+  addCompanyFromUrl({ cfg, db, chatId, url: cand.url })
+);
           const deal = createDealForCompany({ cfg, db, chatId, company, channel: "LinkedIn" });
 
-          setFlow(db, chatId, "PRESENT_TARGET", {
-            queue,
-            companyName: company.name,
-            companyUrl: company.website,
-            baseDraft: deal.messageDraft || deal.message || "",
-            searchQuery: flowContext.searchQuery,
-            searchIndex: flowContext.searchIndex,
-            searchTotal: flowContext.searchTotal,
-          });
+        setFlow(db, chatId, "PRESENT_TARGET", {
+  queue,
+  companyName: company.name,
+  companyUrl: company.website,
+  baseDraft: deal.messageDraft || deal.message || "",
+  analysis: company.analysis, // ✅ serve per draft AI nel passo successivo
+  searchQuery: flowContext.searchQuery,
+  searchIndex: flowContext.searchIndex,
+  searchTotal: flowContext.searchTotal,
+});
 
           return tgSend(cfg, chatId, briefCompanyText(company, deal, queue.length));
         }
@@ -532,9 +820,41 @@ Contatto: ${lastDraft.contact}`
         }
 
         if (/^s[iì]$/i.test(txt) || /^si$/i.test(txt)) {
-          setFlow(db, chatId, "ASK_ANGLE", { ...flowContext, queue });
-          return tgSend(cfg, chatId, angleMenu());
-        }
+  const llmOn =
+    String(cfg?.LLM_PROVIDER || "").toLowerCase() === "openai" &&
+    String(cfg?.LLM_API_KEY || "").trim().length > 0;
+
+  // se LLM non attivo, fallback ai menu standard
+  if (!llmOn) {
+    setFlow(db, chatId, "ASK_ANGLE", { ...flowContext, queue });
+    return tgSend(cfg, chatId, angleMenu());
+  }
+
+  try {
+   const draftPack = await withTyping(cfg, chatId, () =>
+  draftOutboundWithLLM({
+    cfg,
+    company: {
+      name: flowContext.companyName,
+      website: flowContext.companyUrl,
+      analysis: flowContext.analysis,
+    },
+    channel: "LinkedIn",
+  })
+);
+
+    setFlow(db, chatId, "PICK_DRAFT", { ...flowContext, queue, draftPack });
+    return tgSend(cfg, chatId, renderDraftChoices(draftPack));
+  } catch (e) {
+    // fallback pulito se l'AI draft fallisce
+    setFlow(db, chatId, "ASK_ANGLE", { ...flowContext, queue });
+    return tgSend(
+      cfg,
+      chatId,
+      `Draft AI non disponibile (${e.message}). Vado con menu standard.\n\n${angleMenu()}`
+    );
+  }
+}
 
         if (/^no$/i.test(txt)) {
           return handleCommand({ cfg, db, chatId, user, parsed: { cmd: "/prossima", args: "" } });
@@ -600,6 +920,53 @@ Se vuoi saltare: No`
         setFlow(db, chatId, "FINAL", { ...flowContext, finalDraft: draft2 });
         return tgSend(cfg, chatId, "Ricevuto. Vuoi confermare così? (OK) oppure scrivimi un’altra correzione.");
       }
+
+      // PICK_DRAFT
+if (flowState === "PICK_DRAFT") {
+  const pack = flowContext?.draftPack || {};
+  const drafts = Array.isArray(pack?.drafts) ? pack.drafts : [];
+  const queue = Array.isArray(flowContext.queue) ? flowContext.queue : [];
+
+  if (/^no$/i.test(txt)) {
+    return handleCommand({ cfg, db, chatId, user, parsed: { cmd: "/prossima", args: "" } });
+  }
+
+  if (/^rigenera$/i.test(txt)) {
+  try {
+    const newPack = await withTyping(cfg, chatId, () =>
+      draftOutboundWithLLM({
+        cfg,
+        company: {
+          name: flowContext.companyName,
+          website: flowContext.companyUrl,
+          analysis: flowContext.analysis,
+        },
+        channel: "LinkedIn",
+      })
+    );
+
+    setFlow(db, chatId, "PICK_DRAFT", { ...flowContext, queue, draftPack: newPack });
+    return tgSend(cfg, chatId, renderDraftChoices(newPack));
+  } catch (e) {
+    return tgSend(cfg, chatId, `Errore rigenerazione: ${e.message}`);
+  }
+}
+
+  const pick = String(txt || "").trim();
+  const chosen = drafts.find((d) => d.id === pick);
+  if (!chosen) {
+    return tgSend(cfg, chatId, "Rispondi 1/2/3 oppure RIGENERA oppure NO.");
+  }
+
+  // porta avanti il flusso standard di conferma/salvataggio
+  setFlow(db, chatId, "ASK_CHANNEL", {
+    ...flowContext,
+    queue,
+    finalDraft: chosen.text,
+  });
+
+  return tgSend(cfg, chatId, channelMenu());
+}
 
       // ASK_CHANNEL
       if (flowState === "ASK_CHANNEL") {
