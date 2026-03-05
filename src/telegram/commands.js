@@ -1,5 +1,5 @@
 // src/telegram/commands.js
-import { tgSend, tgAction } from "./templates.js";
+import { tgSend, tgAction, tgSendOne, tgEdit, tgDelete } from "./templates.js";
 import { upsertUserPrefs, getUserPrefs } from "../core/state.js";
 import { addCompanyFromUrl, proposeNextCompany, draftOutboundWithLLM } from "../services/companyAnalyzer.js";
 import {
@@ -15,8 +15,6 @@ import {
 } from "../core/pipeline.js";
 import { searchWeb } from "../services/search.js";
 
-
-
 export function parseCommand(text) {
   const t = String(text || "").trim();
   if (!t.startsWith("/")) return { cmd: "free", args: t };
@@ -24,22 +22,58 @@ export function parseCommand(text) {
   return { cmd: head.toLowerCase(), args: rest.join(" ").trim() };
 }
 
-// ✅ ADD THIS (top-level)
-async function withTyping(cfg, chatId, fn) {
-  let stop = false;
+// typing indicator
+// typing indicator (robusto)
+async function withTyping(cfg, chatId, fn, {
+  action = "typing",
+  progressText = "⏳ Sto elaborando…",
+  showProgressMessage = true,
+} = {}) {
+  let timer = null;
+  let stopped = false;
 
-  const loop = (async () => {
-    while (!stop) {
-      try { await tgAction(cfg, chatId, "typing"); } catch {}
-      await new Promise((r) => setTimeout(r, 3500));
+  // (1) messaggio “progress” visibile al 100%
+  let progressMsg = null;
+  if (showProgressMessage) {
+    try {
+      progressMsg = await tgSendOne(cfg, chatId, progressText);
+    } catch (e) {
+      console.error("[tgSendOne progress]", e?.message || e);
     }
-  })();
+  }
+
+  // (2) typing best-effort
+  const tick = async () => {
+    if (stopped) return;
+    try { await tgAction(cfg, chatId, action); } catch (e) {
+      // IMPORTANT: loggalo, sennò non capisci mai se Telegram sta rifiutando
+      console.error("[tgAction]", e?.message || e);
+    }
+  };
+
+  await tick();
+  timer = setInterval(() => { tick(); }, 4000);
 
   try {
-    return await fn();
+    const res = await fn();
+
+    // chiudi progress (edit in “✅ Fatto” oppure lo cancelli)
+    if (progressMsg?.message_id) {
+      try {
+        await tgEdit(cfg, chatId, progressMsg.message_id, "✅ Pronto.");
+        // opzionale: cancellalo dopo un attimo
+        setTimeout(() => {
+          tgDelete(cfg, chatId, progressMsg.message_id).catch(() => {});
+        }, 1200);
+      } catch (e) {
+        console.error("[tgEdit/tgDelete]", e?.message || e);
+      }
+    }
+
+    return res;
   } finally {
-    stop = true;
-    await loop.catch(() => {});
+    stopped = true;
+    if (timer) clearInterval(timer);
   }
 }
 
@@ -93,6 +127,12 @@ function renderDraftChoices(draftPack) {
 
   for (const d of drafts) {
     lines.push(`(${d.id}) [${d.tone} | ${d.angle}]`);
+
+    // ✅ Email subject visible when present
+    if (d.subject && String(d.subject).trim()) {
+      lines.push(`OGGETTO: ${String(d.subject).trim()}`);
+    }
+
     lines.push(d.text);
     lines.push("");
   }
@@ -122,22 +162,32 @@ function briefCompanyText(company, deal, remaining) {
 
   const lines = [];
 
-  // --- BLOCCO 1: profilo ---
   lines.push(`Azienda: ${company?.name || "-"}`);
   lines.push(`Link: ${company?.website || "-"}`);
-  lines.push(`Settore: ${company?.sector || "-"} | Paese: ${company?.country || "-"} | Size: ${company?.sizeEst || "-"}`);
+  lines.push(
+    `Settore: ${company?.sector || "-"} | Paese: ${company?.country || "-"} | Size: ${
+      company?.sizeEst || "-"
+    }`
+  );
 
   const cm = typeof conf.company_match === "number" ? conf.company_match : "-";
   const cs = typeof conf.sector === "number" ? conf.sector : "-";
   const cz = typeof conf.size_est === "number" ? conf.size_est : "-";
   lines.push(`Confidence: match ${cm} | settore ${cs} | size ${cz}`);
 
-  // contact hint
   if (ch && ch.channel && ch.channel !== "NONE") {
     if (ch.channel === "EMAIL") {
-      lines.push(`Contatto (hint): EMAIL ${ch.email || "-"} (ref ${ch.evidence_ref || "-"}) conf=${ch.confidence ?? "-"}`);
+      lines.push(
+        `Contatto (hint): EMAIL ${ch.email || "-"} (ref ${ch.evidence_ref || "-"}) conf=${
+          ch.confidence ?? "-"
+        }`
+      );
     } else if (ch.channel === "LINKEDIN") {
-      lines.push(`Contatto (hint): LINKEDIN ${ch.url || "-"} (ref ${ch.evidence_ref || "-"}) conf=${ch.confidence ?? "-"}`);
+      lines.push(
+        `Contatto (hint): LINKEDIN ${ch.url || "-"} (ref ${ch.evidence_ref || "-"}) conf=${
+          ch.confidence ?? "-"
+        }`
+      );
     }
   } else {
     lines.push(`Contatto (hint): non trovato`);
@@ -145,14 +195,12 @@ function briefCompanyText(company, deal, remaining) {
 
   lines.push("");
 
-  // --- BLOCCO 2: strategia ---
   lines.push(`Ruolo target: ${role}`);
   lines.push(`Perché: ${roleWhy}`);
   lines.push(`Angolo: ${angle}`);
   if (company?.whyNow) lines.push(`Why now: ${company.whyNow}`);
   if (company?.icebreaker) lines.push(`Icebreaker: ${company.icebreaker}`);
 
-  // segnali / pains
   if (signals.length) {
     lines.push("");
     lines.push(`Segnali (top ${Math.min(signals.length, 10)}):`);
@@ -165,7 +213,6 @@ function briefCompanyText(company, deal, remaining) {
     pains.slice(0, 8).forEach((p) => lines.push(`- ${p}`));
   }
 
-  // evidence_map (più estesa)
   if (evTop.length) {
     lines.push("");
     lines.push(`Fatti da snippet (${evTop.length}):`);
@@ -204,9 +251,9 @@ function qrQuestion() {
   return "Nel testo citiamo esplicitamente “QR operativo”? (QR/Senza)";
 }
 
-function channelMenu() {
+function outboundChannelMenu() {
   return [
-    "Perfetto. Su che canale lo invii?",
+    "Perfetto. Prima cosa: su che canale lo invii?",
     "1) LinkedIn",
     "2) Email",
     "Rispondi 1/2",
@@ -230,10 +277,82 @@ function looksLikeLinkedInUrl(s) {
   return t.includes("linkedin.com/");
 }
 
+/**
+ * Mini-questionario per arricchire le bozze.
+ * Salviamo in flowContext.enrich:
+ * - cta: call_15 | find_decider | get_info | demo
+ * - pain: audit | docs | export_verify | trace_ncr
+ * - proof: case_real | qr_demo | zero_change | iso_mindset
+ * - constraints: stringa tipo "ACD" oppure ""
+ * - hook: testo libero (opzionale)
+ */
+function enrichQuestions() {
+  return [
+    {
+      key: "cta",
+      text: [
+        "Obiettivo del primo contatto?",
+        "1) Call 10-15 min",
+        "2) Capire chi decide (ruolo/nome) + chiedere intro",
+        "3) Ottenere info su come gestiscono oggi (domanda operativa)",
+        "4) Proporre mini-demo / esempio",
+        "Rispondi 1/2/3/4",
+      ].join("\n"),
+      validate: (t) => /^[1-4]$/.test(t),
+      map: (t) => ({ "1": "call_15", "2": "find_decider", "3": "get_info", "4": "demo" }[t]),
+    },
+    {
+      key: "pain",
+      text: [
+        "Angolo/pain principale?",
+        "1) Audit/ISO: tempi e attriti",
+        "2) Documenti: versioni/duplicati/errori",
+        "3) Clienti esteri: verifica rapida & fiducia",
+        "4) Lotti/NCR/reclami: tracciabilità operativa",
+        "Rispondi 1/2/3/4",
+      ].join("\n"),
+      validate: (t) => /^[1-4]$/.test(t),
+      map: (t) => ({ "1": "audit", "2": "docs", "3": "export_verify", "4": "trace_ncr" }[t]),
+    },
+    {
+      key: "proof",
+      text: [
+        "Che prova/credibilità usiamo (1 scelta)?",
+        "1) Caso reale (esperienza su lotti/produzione)",
+        "2) Demo con QR verificabile (senza buzzword)",
+        "3) Approccio 'zero-change' (non stravolgi ERP)",
+        "4) Approccio qualità/ISO (pragmatico)",
+        "Rispondi 1/2/3/4",
+      ].join("\n"),
+      validate: (t) => /^[1-4]$/.test(t),
+      map: (t) => ({ "1": "case_real", "2": "qr_demo", "3": "zero_change", "4": "iso_mindset" }[t]),
+    },
+    {
+      key: "constraints",
+      text: [
+        "Vincoli: cosa EVITARE? (scrivi lettere, es: ACD — oppure 0 per nessuno)",
+        "A) Non dire 'blockchain'",
+        "B) Non dire 'NFT'",
+        "C) Non parlare di prezzi",
+        "D) Max 500 caratteri (LinkedIn)",
+        "E) Super formale",
+        "Rispondi: 0 oppure combinazione (es: ACD)",
+      ].join("\n"),
+      validate: (t) => /^0$|^[A-E]{1,5}$/i.test(t),
+      map: (t) => (t === "0" ? "" : t.toUpperCase()),
+    },
+    {
+      key: "hook",
+      text: "Extra (opzionale): incolla un aggancio/contesto (oppure scrivi SKIP).",
+      validate: (_) => true,
+      map: (t) => (/^skip$/i.test(t) ? "" : String(t || "").trim()),
+    },
+  ];
+}
+
 function buildDraftFromChoices({ baseDraft, angleChoice, toneChoice, qrChoice }) {
   let intro = baseDraft;
 
-  // Angolo
   if (angleChoice === "1") {
     intro = intro.replace(
       "riducendo il tempo speso in audit e verifiche documentali",
@@ -251,24 +370,16 @@ function buildDraftFromChoices({ baseDraft, angleChoice, toneChoice, qrChoice })
     );
   }
 
-  // QR esplicito / implicito
   if (qrChoice === "QR") {
     if (!/QR/i.test(intro)) {
-      intro = intro.replace(
-        "verificabili tramite QR operativo",
-        "verificabili tramite QR operativo"
-      );
+      intro = intro.replace("verificabili tramite QR operativo", "verificabili tramite QR operativo");
     }
   } else if (qrChoice === "Senza") {
     intro = intro.replace(/tramite QR operativo,?\s*/i, "in modo verificabile, ");
   }
 
-  // Tono (ritocchi)
   if (toneChoice === "1") {
-    intro = intro.replace(
-      "Mi chiedevo se possa avere senso un confronto di 15 minuti",
-      "Se ha senso, ci sentiamo 15 minuti"
-    );
+    intro = intro.replace("Mi chiedevo se possa avere senso un confronto di 15 minuti", "Se ha senso, ci sentiamo 15 minuti");
   } else if (toneChoice === "3") {
     intro = intro.replace("Mi chiedevo se possa avere senso", "Le chiedo se possa avere senso");
   }
@@ -280,82 +391,74 @@ export async function handleCommand({ cfg, db, chatId, user, parsed }) {
   const prefs = getUserPrefs({ db, chatId });
 
   switch (parsed.cmd) {
+    case "/db": {
+      const arg = String(parsed.args || "").trim();
 
-case "/db": {
-  const arg = String(parsed.args || "").trim();
+      if (!arg || /^help$/i.test(arg)) {
+        return tgSend(
+          cfg,
+          chatId,
+          [
+            "🧹 Comandi DB:",
+            "/db purge_all               (RESET TOTALE per questo chatId)",
+            "/db purge messages|notes|deals|companies",
+            "/db del <nome_azienda>      (cancella azienda + storico)",
+            "/db prune <N>               (tieni ultimi N deals, cancella il resto)",
+            "",
+            "⚠️ Attenzione: purge_all è irreversibile.",
+          ].join("\n")
+        );
+      }
 
-  // help
-  if (!arg || /^help$/i.test(arg)) {
-    return tgSend(
-      cfg,
-      chatId,
-      [
-        "🧹 Comandi DB:",
-        "/db purge_all               (RESET TOTALE per questo chatId)",
-        "/db purge messages|notes|deals|companies",
-        "/db del <nome_azienda>      (cancella azienda + storico)",
-        "/db prune <N>               (tieni ultimi N deals, cancella il resto)",
-        "",
-        "⚠️ Attenzione: purge_all è irreversibile.",
-      ].join("\n")
-    );
-  }
+      if (/^purge_all$/i.test(arg)) {
+        purgeAllForChat({ db, chatId });
+        upsertUserPrefs({ db, chatId, patch: { flowState: "IDLE", flowContext: {}, lastDraftMessage: null } });
+        return tgSend(cfg, chatId, "Fatto ✅ DB pulito (tutto) per questo chatId.");
+      }
 
-  // reset totale
-  if (/^purge_all$/i.test(arg)) {
-    purgeAllForChat({ db, chatId });
-    // opzionale: azzera anche flow e lastDraft
-    upsertUserPrefs({ db, chatId, patch: { flowState: "IDLE", flowContext: {}, lastDraftMessage: null } });
-    return tgSend(cfg, chatId, "Fatto ✅ DB pulito (tutto) per questo chatId.");
-  }
+      if (/^purge\s+/i.test(arg)) {
+        const what = arg.replace(/^purge\s+/i, "").trim().toLowerCase();
 
-  // purge selettivo
-  if (/^purge\s+/i.test(arg)) {
-    const what = arg.replace(/^purge\s+/i, "").trim().toLowerCase();
+        const flags = {
+          messages: what === "messages",
+          notes: what === "notes",
+          deals: what === "deals",
+          companies: what === "companies",
+        };
 
-    const flags = {
-      messages: what === "messages",
-      notes: what === "notes",
-      deals: what === "deals",
-      companies: what === "companies",
-    };
+        if (!flags.messages && !flags.notes && !flags.deals && !flags.companies) {
+          return tgSend(cfg, chatId, "Uso: /db purge messages|notes|deals|companies");
+        }
 
-    if (!flags.messages && !flags.notes && !flags.deals && !flags.companies) {
-      return tgSend(cfg, chatId, "Uso: /db purge messages|notes|deals|companies");
+        if (flags.companies) {
+          purgeAllForChat({ db, chatId });
+          upsertUserPrefs({ db, chatId, patch: { flowState: "IDLE", flowContext: {}, lastDraftMessage: null } });
+          return tgSend(cfg, chatId, "Fatto ✅ cancellate companies (e cascata completa) per questo chatId.");
+        }
+
+        purgeForChat({ db, chatId, flags });
+        return tgSend(cfg, chatId, `Fatto ✅ purge ${what}.`);
+      }
+
+      if (/^del\s+/i.test(arg)) {
+        const name = arg.replace(/^del\s+/i, "").trim();
+        const res = deleteCompanyCascade({ db, chatId, companyName: name });
+        if (!res.ok) {
+          if (res.reason === "not_found") return tgSend(cfg, chatId, `Non trovo "${name}" nel DB.`);
+          return tgSend(cfg, chatId, "Nome azienda mancante. Uso: /db del <nome_azienda>");
+        }
+        return tgSend(cfg, chatId, `Fatto ✅ eliminata: ${res.deletedCompanyName} (id ${res.deletedCompanyId}).`);
+      }
+
+      if (/^prune\s+/i.test(arg)) {
+        const n = Number(arg.replace(/^prune\s+/i, "").trim());
+        if (!Number.isFinite(n) || n < 0) return tgSend(cfg, chatId, "Uso: /db prune <N>  (es: /db prune 50)");
+        pruneDealsKeepLastN({ db, chatId, keep: n });
+        return tgSend(cfg, chatId, `Fatto ✅ tenuti ultimi ${n} deals (cancellato il resto).`);
+      }
+
+      return tgSend(cfg, chatId, "Comando non riconosciuto. Scrivi /db help.");
     }
-
-    // se chiedi companies ma non chiedi deals/messages/notes, li cancelliamo comunque prima per coerenza
-    if (flags.companies) {
-      purgeAllForChat({ db, chatId });
-      upsertUserPrefs({ db, chatId, patch: { flowState: "IDLE", flowContext: {}, lastDraftMessage: null } });
-      return tgSend(cfg, chatId, "Fatto ✅ cancellate companies (e cascata completa) per questo chatId.");
-    }
-
-    purgeForChat({ db, chatId, flags });
-    return tgSend(cfg, chatId, `Fatto ✅ purge ${what}.`);
-  }
-
-  // delete azienda
-  if (/^del\s+/i.test(arg)) {
-    const name = arg.replace(/^del\s+/i, "").trim();
-    const res = deleteCompanyCascade({ db, chatId, companyName: name });
-    if (!res.ok) {
-      if (res.reason === "not_found") return tgSend(cfg, chatId, `Non trovo "${name}" nel DB.`);
-      return tgSend(cfg, chatId, "Nome azienda mancante. Uso: /db del <nome_azienda>");
-    }
-    return tgSend(cfg, chatId, `Fatto ✅ eliminata: ${res.deletedCompanyName} (id ${res.deletedCompanyId}).`);
-  }
-
-  // prune
-  if (/^prune\s+/i.test(arg)) {
-    const n = Number(arg.replace(/^prune\s+/i, "").trim());
-    if (!Number.isFinite(n) || n < 0) return tgSend(cfg, chatId, "Uso: /db prune <N>  (es: /db prune 50)");
-    pruneDealsKeepLastN({ db, chatId, keep: n });
-    return tgSend(cfg, chatId, `Fatto ✅ tenuti ultimi ${n} deals (cancellato il resto).`);
-  }
-
-  return tgSend(cfg, chatId, "Comando non riconosciuto. Scrivi /db help.");
-}
 
     case "/modo": {
       const arg = (parsed.args || "").trim().toLowerCase();
@@ -376,18 +479,14 @@ case "/db": {
 
     case "/stop": {
       upsertUserPrefs({ db, chatId, patch: { flowState: "IDLE", flowContext: {} } });
-      return tgSend(
-        cfg,
-        chatId,
-        "Ok, stop. Quando vuoi ripartire: scrivi 'cerca' o usa /cerca <query>."
-      );
+      return tgSend(cfg, chatId, "Ok, stop. Quando vuoi ripartire: scrivi 'cerca' o usa /cerca <query>.");
     }
 
     case "/start":
-  return tgSend(
-    cfg,
-    chatId,
-    `Ciao! Sono CI Sales Agent.
+      return tgSend(
+        cfg,
+        chatId,
+        `Ciao! Sono CI Sales Agent.
 Comandi:
 - /cerca <query>
 - /analizza <url>
@@ -398,7 +497,7 @@ Comandi:
 - /pipeline
 - /filtri set key=value
 - /db help   (gestione e pulizia database)`
-  );
+      );
 
     case "/webhook": {
       const { tgSetWebhook, tgGetWebhookInfo } = await import("./templates.js");
@@ -439,7 +538,6 @@ Comandi:
       const { uiMode } = getFlow(db, chatId);
       const query = (parsed.args || "").trim();
 
-      // console mode
       if (uiMode === "console") {
         if (!query) return tgSend(cfg, chatId, "Uso: /cerca <query>");
 
@@ -476,7 +574,6 @@ Comandi:
         return tgSend(cfg, chatId, renderCandidate(first, 1, candidates.length));
       }
 
-      // dialog mode
       if (!query) {
         setFlow(db, chatId, "ASK_QUERY", {});
         return tgSend(cfg, chatId, "Ok. Dimmi la ricerca (es: 'meccanica ISO 9001 Lombardia export').");
@@ -520,10 +617,9 @@ Comandi:
         const next = queue[0];
         const rest = queue.slice(1);
 
-        // coda con candidate object
         if (next && typeof next === "object" && next.url) {
           const idx = Number(flowContext.searchIndex || 1) + 1;
-          const total = Number(flowContext.searchTotal || (rest.length + 1));
+          const total = Number(flowContext.searchTotal || rest.length + 1);
 
           setFlow(db, chatId, "PRESENT_LINK", {
             ...flowContext,
@@ -536,7 +632,6 @@ Comandi:
           return tgSend(cfg, chatId, renderCandidate(next, idx, total));
         }
 
-        // fallback vecchio (queue era array di url)
         const nextUrl = String(next || "");
         const company = await addCompanyFromUrl({ cfg, db, chatId, url: nextUrl });
         const deal = createDealForCompany({ cfg, db, chatId, company, channel: "LinkedIn" });
@@ -547,19 +642,18 @@ Comandi:
           companyName: company.name,
           companyUrl: company.website,
           baseDraft: deal.messageDraft,
+          analysis: company.analysis,
         });
 
         return tgSend(cfg, chatId, briefCompanyText(company, deal, rest.length));
       }
 
-      // console fallback
       const next = await proposeNextCompany({ cfg, db, chatId });
       if (!next) return tgSend(cfg, chatId, "Non ho altre aziende in coda. Usa /cerca <query> oppure /analizza <url>.");
       return tgSend(cfg, chatId, renderCompanyProposal(next.company, next.deal));
     }
 
     case "/ok": {
-      // Ora pretendiamo anche channel + contact
       const lastDraft = prefs?.lastDraftMessage;
       if (!lastDraft?.companyName || !lastDraft?.text) {
         return tgSend(cfg, chatId, "Non ho un messaggio draft da finalizzare. Prima /analizza (o /cerca) e completa il flow.");
@@ -568,14 +662,21 @@ Comandi:
         return tgSend(cfg, chatId, "Mi manca il contatto/canale. Completa il flow (canale + contatto) e poi OK.");
       }
 
-      // Persiste OUTBOUND (assumendo che pipeline.js supporti i campi extra; se non li supporta, vedi nota sotto)
+      // ✅ se Email, includi OGGETTO nel testo persistito (così non dipendi dal DB)
+      const savedText =
+        lastDraft.channel === "Email" && lastDraft.subject
+          ? `OGGETTO: ${lastDraft.subject}\n\n${lastDraft.text}`
+          : lastDraft.text;
+
       recordOutboundMessage({
         db,
         chatId,
         companyName: lastDraft.companyName,
-        text: lastDraft.text,
+        text: savedText,
         channel: lastDraft.channel,
         contact: lastDraft.contact,
+        // opzionale: se pipeline.js non lo supporta, non cambia nulla.
+        subject: lastDraft.subject || null,
       });
 
       setDealStage({ db, chatId, companyName: lastDraft.companyName, stage: "Contattato" });
@@ -585,7 +686,9 @@ Comandi:
         chatId,
         `Fatto ✅ Messaggio salvato come OUTBOUND e stato=Contattato.
 Canale: ${lastDraft.channel}
-Contatto: ${lastDraft.contact}`
+Contatto: ${lastDraft.contact}${
+          lastDraft.channel === "Email" && lastDraft.subject ? `\nOggetto: ${lastDraft.subject}` : ""
+        }`
       );
     }
 
@@ -604,101 +707,90 @@ Contatto: ${lastDraft.contact}`
     }
 
     case "/pipeline": {
-  const arg = String(parsed.args || "").trim();
+      const arg = String(parsed.args || "").trim();
 
-  // Se l'utente scrive: /pipeline 3  (o /pipeline nomeazienda...)
-  // apriamo direttamente il dettaglio
-  if (arg) {
-    const rows = listPipeline({ db, chatId });
-    if (!rows.length) return tgSend(cfg, chatId, "Pipeline vuota.");
+      if (arg) {
+        const rows = listPipeline({ db, chatId });
+        if (!rows.length) return tgSend(cfg, chatId, "Pipeline vuota.");
 
-    // prova numero
-    const n = Number(arg);
-    let picked = null;
+        const n = Number(arg);
+        let picked = null;
 
-    if (Number.isFinite(n) && n >= 1 && n <= rows.length) {
-      picked = rows[n - 1];
-    } else {
-      // fallback: match per nome (contains, case-insensitive)
-      const q = arg.toLowerCase();
-      picked = rows.find(r => String(r.companyName || "").toLowerCase().includes(q));
+        if (Number.isFinite(n) && n >= 1 && n <= rows.length) {
+          picked = rows[n - 1];
+        } else {
+          const q = arg.toLowerCase();
+          picked = rows.find((r) => String(r.companyName || "").toLowerCase().includes(q));
+        }
+
+        if (!picked) {
+          return tgSend(cfg, chatId, `Non trovo "${arg}". Usa /pipeline per vedere la lista e scegliere il numero.`);
+        }
+
+        const stage = picked.stage || "-";
+        const role = picked.roleTarget || "-";
+        const why = picked.roleWhy || "-";
+        const ch = picked.channel || picked.lastOutboundChannel || "-";
+        const contact = picked.lastOutboundContact || "-";
+        const next = picked.nextFollowupAt || "-";
+        const lastAt = picked.lastOutboundAt || "-";
+        const msg = picked.lastOutboundText ? String(picked.lastOutboundText).trim() : "(nessun messaggio OUTBOUND salvato)";
+
+        const detail = [
+          `📌 *${picked.companyName}*`,
+          `Stato: ${stage}`,
+          `Canale: ${ch}`,
+          `Contatto: ${contact}`,
+          `Next followup: ${next}`,
+          "",
+          `Target: ${role}`,
+          `Perché: ${why}`,
+          "",
+          `Ultimo OUT (${lastAt}):`,
+          msg.length > 3500 ? msg.slice(0, 3500) + "…" : msg,
+        ].join("\n");
+
+        return tgSend(cfg, chatId, detail);
+      }
+
+      const rows = listPipeline({ db, chatId });
+      if (!rows.length) return tgSend(cfg, chatId, "Pipeline vuota.");
+
+      setFlow(db, chatId, "PIPELINE_LIST", {
+        pipelineList: rows.map((r) => ({
+          companyName: r.companyName,
+          stage: r.stage,
+          channel: r.channel,
+          nextFollowupAt: r.nextFollowupAt,
+          lastOutboundAt: r.lastOutboundAt,
+          lastOutboundChannel: r.lastOutboundChannel,
+          lastOutboundContact: r.lastOutboundContact,
+          lastOutboundText: r.lastOutboundText,
+          roleTarget: r.roleTarget,
+          roleWhy: r.roleWhy,
+        })),
+      });
+
+      const lines = [];
+      lines.push("📋 *Pipeline*");
+      lines.push("Rispondi con un numero per aprire il dettaglio (es: 3).");
+      lines.push("Oppure: /pipeline <numero>  |  /stop");
+      lines.push("");
+
+      rows.slice(0, 30).forEach((r, i) => {
+        const idx = i + 1;
+        const stage = r.stage || "-";
+        const ch = r.channel || r.lastOutboundChannel || "-";
+        const contact = r.lastOutboundContact ? ` · ${r.lastOutboundContact}` : "";
+        const next = r.nextFollowupAt ? ` · next ${r.nextFollowupAt}` : "";
+        const last = r.lastOutboundAt ? ` · last ${r.lastOutboundAt}` : "";
+        lines.push(`${idx}) ${r.companyName} — ${stage} — ${ch}${contact}${next}${last}`);
+      });
+
+      if (rows.length > 30) lines.push(`\n(visualizzate 30 su ${rows.length})`);
+
+      return tgSend(cfg, chatId, lines.join("\n"));
     }
-
-    if (!picked) {
-      return tgSend(cfg, chatId, `Non trovo "${arg}". Usa /pipeline per vedere la lista e scegliere il numero.`);
-    }
-
-    // dettaglio “leggibile”
-    const stage = picked.stage || "-";
-    const role = picked.roleTarget || "-";
-    const why = picked.roleWhy || "-";
-    const ch = picked.channel || picked.lastOutboundChannel || "-";
-    const contact = picked.lastOutboundContact || "-";
-    const next = picked.nextFollowupAt || "-";
-    const lastAt = picked.lastOutboundAt || "-";
-    const msg = picked.lastOutboundText
-      ? String(picked.lastOutboundText).trim()
-      : "(nessun messaggio OUTBOUND salvato)";
-
-    const detail = [
-      `📌 *${picked.companyName}*`,
-      `Stato: ${stage}`,
-      `Canale: ${ch}`,
-      `Contatto: ${contact}`,
-      `Next followup: ${next}`,
-      "",
-      `Target: ${role}`,
-      `Perché: ${why}`,
-      "",
-      `Ultimo OUT (${lastAt}):`,
-      msg.length > 3500 ? msg.slice(0, 3500) + "…" : msg,
-    ].join("\n");
-
-    // se vuoi Markdown, abilita parse_mode e fai escaping.
-    return tgSend(cfg, chatId, detail);
-  }
-
-  // Step 1: elenco compatto + salvataggio “indice”
-  const rows = listPipeline({ db, chatId });
-  if (!rows.length) return tgSend(cfg, chatId, "Pipeline vuota.");
-
-  // salva in flowContext la lista ordinata
-  setFlow(db, chatId, "PIPELINE_LIST", {
-    pipelineList: rows.map(r => ({
-      companyName: r.companyName,
-      stage: r.stage,
-      channel: r.channel,
-      nextFollowupAt: r.nextFollowupAt,
-      lastOutboundAt: r.lastOutboundAt,
-      lastOutboundChannel: r.lastOutboundChannel,
-      lastOutboundContact: r.lastOutboundContact,
-      lastOutboundText: r.lastOutboundText,
-      roleTarget: r.roleTarget,
-      roleWhy: r.roleWhy,
-    })),
-  });
-
-  // costruisci output “a tabella” ma compatto
-  const lines = [];
-  lines.push("📋 *Pipeline*");
-  lines.push("Rispondi con un numero per aprire il dettaglio (es: 3).");
-  lines.push("Oppure: /pipeline <numero>  |  /stop");
-  lines.push("");
-
-  rows.slice(0, 30).forEach((r, i) => {
-    const idx = i + 1;
-    const stage = r.stage || "-";
-    const ch = r.channel || r.lastOutboundChannel || "-";
-    const contact = r.lastOutboundContact ? ` · ${r.lastOutboundContact}` : "";
-    const next = r.nextFollowupAt ? ` · next ${r.nextFollowupAt}` : "";
-    const last = r.lastOutboundAt ? ` · last ${r.lastOutboundAt}` : "";
-    lines.push(`${idx}) ${r.companyName} — ${stage} — ${ch}${contact}${next}${last}`);
-  });
-
-  if (rows.length > 30) lines.push(`\n(visualizzate 30 su ${rows.length})`);
-
-  return tgSend(cfg, chatId, lines.join("\n"));
-}
 
     case "free":
     default: {
@@ -711,47 +803,44 @@ Contatto: ${lastDraft.contact}`
         return tgSend(cfg, chatId, "Ok. Usa /cerca oppure /analizza.");
       }
 
-      // PIPELINE_LIST: l'utente risponde "3" e apriamo quel record
-if (flowState === "PIPELINE_LIST") {
-  const list = Array.isArray(flowContext.pipelineList) ? flowContext.pipelineList : [];
-  const n = Number(txt);
+      // PIPELINE_LIST quick open
+      if (flowState === "PIPELINE_LIST") {
+        const list = Array.isArray(flowContext.pipelineList) ? flowContext.pipelineList : [];
+        const n = Number(txt);
 
-  if (!Number.isFinite(n) || n < 1 || n > list.length) {
-    return tgSend(cfg, chatId, "Scrivi un numero valido della lista (es: 1, 2, 3) oppure /stop.");
-  }
+        if (!Number.isFinite(n) || n < 1 || n > list.length) {
+          return tgSend(cfg, chatId, "Scrivi un numero valido della lista (es: 1, 2, 3) oppure /stop.");
+        }
 
-  const picked = list[n - 1];
+        const picked = list[n - 1];
 
-  // chiudi flow
-  setFlow(db, chatId, "IDLE", {});
+        setFlow(db, chatId, "IDLE", {});
 
-  // riusa la stessa vista dettaglio del /pipeline <arg>
-  // (qui la ricostruiamo inline)
-  const stage = picked.stage || "-";
-  const ch = picked.channel || picked.lastOutboundChannel || "-";
-  const contact = picked.lastOutboundContact || "-";
-  const next = picked.nextFollowupAt || "-";
-  const lastAt = picked.lastOutboundAt || "-";
-  const role = picked.roleTarget || "-";
-  const why = picked.roleWhy || "-";
-  const msg = picked.lastOutboundText ? String(picked.lastOutboundText).trim() : "(nessun OUTBOUND)";
+        const stage = picked.stage || "-";
+        const ch = picked.channel || picked.lastOutboundChannel || "-";
+        const contact = picked.lastOutboundContact || "-";
+        const next = picked.nextFollowupAt || "-";
+        const lastAt = picked.lastOutboundAt || "-";
+        const role = picked.roleTarget || "-";
+        const why = picked.roleWhy || "-";
+        const msg = picked.lastOutboundText ? String(picked.lastOutboundText).trim() : "(nessun OUTBOUND)";
 
-  const detail = [
-    `📌 *${picked.companyName}*`,
-    `Stato: ${stage}`,
-    `Canale: ${ch}`,
-    `Contatto: ${contact}`,
-    `Next followup: ${next}`,
-    "",
-    `Target: ${role}`,
-    `Perché: ${why}`,
-    "",
-    `Ultimo OUT (${lastAt}):`,
-    msg.length > 3500 ? msg.slice(0, 3500) + "…" : msg,
-  ].join("\n");
+        const detail = [
+          `📌 *${picked.companyName}*`,
+          `Stato: ${stage}`,
+          `Canale: ${ch}`,
+          `Contatto: ${contact}`,
+          `Next followup: ${next}`,
+          "",
+          `Target: ${role}`,
+          `Perché: ${why}`,
+          "",
+          `Ultimo OUT (${lastAt}):`,
+          msg.length > 3500 ? msg.slice(0, 3500) + "…" : msg,
+        ].join("\n");
 
-  return tgSend(cfg, chatId, detail);
-}
+        return tgSend(cfg, chatId, detail);
+      }
 
       // shortcut: "cerca ..."
       if (flowState === "IDLE" && /^cerca\b/i.test(txt)) {
@@ -784,21 +873,24 @@ if (flowState === "PIPELINE_LIST") {
         }
 
         if (/^s[iì]$/i.test(txt) || /^si$/i.test(txt)) {
-          const company = await withTyping(cfg, chatId, () =>
-  addCompanyFromUrl({ cfg, db, chatId, url: cand.url })
+          const company = await withTyping(
+  cfg,
+  chatId,
+  () => addCompanyFromUrl({ cfg, db, chatId, url: cand.url }),
+  { progressText: "⏳ Analizzo l’azienda (snippet + AI)…" }
 );
           const deal = createDealForCompany({ cfg, db, chatId, company, channel: "LinkedIn" });
 
-        setFlow(db, chatId, "PRESENT_TARGET", {
-  queue,
-  companyName: company.name,
-  companyUrl: company.website,
-  baseDraft: deal.messageDraft || deal.message || "",
-  analysis: company.analysis, // ✅ serve per draft AI nel passo successivo
-  searchQuery: flowContext.searchQuery,
-  searchIndex: flowContext.searchIndex,
-  searchTotal: flowContext.searchTotal,
-});
+          setFlow(db, chatId, "PRESENT_TARGET", {
+            queue,
+            companyName: company.name,
+            companyUrl: company.website,
+            baseDraft: deal.messageDraft || deal.message || "",
+            analysis: company.analysis,
+            searchQuery: flowContext.searchQuery,
+            searchIndex: flowContext.searchIndex,
+            searchTotal: flowContext.searchTotal,
+          });
 
           return tgSend(cfg, chatId, briefCompanyText(company, deal, queue.length));
         }
@@ -820,41 +912,20 @@ if (flowState === "PIPELINE_LIST") {
         }
 
         if (/^s[iì]$/i.test(txt) || /^si$/i.test(txt)) {
-  const llmOn =
-    String(cfg?.LLM_PROVIDER || "").toLowerCase() === "openai" &&
-    String(cfg?.LLM_API_KEY || "").trim().length > 0;
+          const llmOn =
+            String(cfg?.LLM_PROVIDER || "").toLowerCase() === "openai" &&
+            String(cfg?.LLM_API_KEY || "").trim().length > 0;
 
-  // se LLM non attivo, fallback ai menu standard
-  if (!llmOn) {
-    setFlow(db, chatId, "ASK_ANGLE", { ...flowContext, queue });
-    return tgSend(cfg, chatId, angleMenu());
-  }
+          if (!llmOn) {
+            // fallback menu standard legacy
+            setFlow(db, chatId, "ASK_ANGLE", { ...flowContext, queue });
+            return tgSend(cfg, chatId, angleMenu());
+          }
 
-  try {
-   const draftPack = await withTyping(cfg, chatId, () =>
-  draftOutboundWithLLM({
-    cfg,
-    company: {
-      name: flowContext.companyName,
-      website: flowContext.companyUrl,
-      analysis: flowContext.analysis,
-    },
-    channel: "LinkedIn",
-  })
-);
-
-    setFlow(db, chatId, "PICK_DRAFT", { ...flowContext, queue, draftPack });
-    return tgSend(cfg, chatId, renderDraftChoices(draftPack));
-  } catch (e) {
-    // fallback pulito se l'AI draft fallisce
-    setFlow(db, chatId, "ASK_ANGLE", { ...flowContext, queue });
-    return tgSend(
-      cfg,
-      chatId,
-      `Draft AI non disponibile (${e.message}). Vado con menu standard.\n\n${angleMenu()}`
-    );
-  }
-}
+          // ✅ nuovo: canale all'inizio
+          setFlow(db, chatId, "ASK_OUTBOUND_CHANNEL", { ...flowContext, queue });
+          return tgSend(cfg, chatId, outboundChannelMenu());
+        }
 
         if (/^no$/i.test(txt)) {
           return handleCommand({ cfg, db, chatId, user, parsed: { cmd: "/prossima", args: "" } });
@@ -863,21 +934,94 @@ if (flowState === "PIPELINE_LIST") {
         return tgSend(cfg, chatId, "Rispondi SÌ o NO (oppure APRI).");
       }
 
-      // ASK_ANGLE
+      // ASK_OUTBOUND_CHANNEL (NEW)
+      if (flowState === "ASK_OUTBOUND_CHANNEL") {
+        if (!/^[12]$/.test(txt)) return tgSend(cfg, chatId, "Rispondi 1 (LinkedIn) oppure 2 (Email).");
+
+        const channel = txt === "1" ? "LinkedIn" : "Email";
+        const qs = enrichQuestions();
+
+        setFlow(db, chatId, "ASK_ENRICH", {
+          ...flowContext,
+          channel,
+          enrich: {},
+          enrichQIndex: 0,
+        });
+
+        return tgSend(cfg, chatId, qs[0].text);
+      }
+
+      // ASK_ENRICH (NEW)
+      if (flowState === "ASK_ENRICH") {
+        const qs = enrichQuestions();
+        const idx = Number(flowContext.enrichQIndex || 0);
+        const q = qs[idx];
+
+        if (!q) {
+          // safety fallback
+          setFlow(db, chatId, "IDLE", {});
+          return tgSend(cfg, chatId, "Ops, stato non valido. Riparti con /cerca oppure /analizza.");
+        }
+
+        const raw = String(txt || "").trim();
+        if (q.validate && !q.validate(raw)) {
+          return tgSend(cfg, chatId, "Risposta non valida. Riprova.\n\n" + q.text);
+        }
+
+        const enrich = { ...(flowContext.enrich || {}) };
+        enrich[q.key] = q.map ? q.map(raw) : raw;
+
+        const nextIdx = idx + 1;
+
+        if (nextIdx >= qs.length) {
+          try {
+            const draftPack = await withTyping(
+  cfg,
+  chatId,
+  () => draftOutboundWithLLM({
+    cfg,
+    company: {
+      name: flowContext.companyName,
+      website: flowContext.companyUrl,
+      analysis: flowContext.analysis,
+    },
+    channel: flowContext.channel || "LinkedIn",
+    enrich,
+  }),
+  { progressText: "⏳ Genero le bozze (AI)…" }
+);
+
+            setFlow(db, chatId, "PICK_DRAFT", {
+              ...flowContext,
+              draftPack,
+              enrich,
+            });
+
+            return tgSend(cfg, chatId, renderDraftChoices(draftPack));
+          } catch (e) {
+            // fallback legacy
+            setFlow(db, chatId, "ASK_ANGLE", { ...flowContext });
+            return tgSend(cfg, chatId, `Draft AI non disponibile (${e.message}). Vado con menu standard.\n\n${angleMenu()}`);
+          }
+        }
+
+        setFlow(db, chatId, "ASK_ENRICH", { ...flowContext, enrich, enrichQIndex: nextIdx });
+        return tgSend(cfg, chatId, qs[nextIdx].text);
+      }
+
+      // Legacy fallback flow (non-LLM)
       if (flowState === "ASK_ANGLE") {
         if (!/^[123]$/.test(txt)) return tgSend(cfg, chatId, "Dimmi 1, 2 o 3.");
         setFlow(db, chatId, "ASK_TONE", { ...flowContext, angleChoice: txt });
         return tgSend(cfg, chatId, toneMenu());
       }
 
-      // ASK_TONE
       if (flowState === "ASK_TONE") {
         if (!/^[123]$/.test(txt)) return tgSend(cfg, chatId, "Dimmi 1, 2 o 3.");
         setFlow(db, chatId, "ASK_QR", { ...flowContext, toneChoice: txt });
         return tgSend(cfg, chatId, qrQuestion());
       }
 
-      // ASK_QR
       if (flowState === "ASK_QR") {
         const norm = /^qr$/i.test(txt) ? "QR" : /^senza$/i.test(txt) ? "Senza" : "";
         if (!norm) return tgSend(cfg, chatId, "Rispondi: QR oppure Senza.");
@@ -889,7 +1033,7 @@ if (flowState === "PIPELINE_LIST") {
           qrChoice: norm,
         });
 
-        setFlow(db, chatId, "FINAL", { ...flowContext, finalDraft: draft });
+        setFlow(db, chatId, "FINAL", { ...flowContext, finalDraft: draft, channel: "LinkedIn" });
 
         return tgSend(
           cfg,
@@ -903,89 +1047,82 @@ Se vuoi saltare: No`
         );
       }
 
-      // FINAL
       if (flowState === "FINAL") {
         if (/^ok$/i.test(txt)) {
-          // Ora chiediamo canale prima di salvare
-          setFlow(db, chatId, "ASK_CHANNEL", { ...flowContext });
-          return tgSend(cfg, chatId, channelMenu());
+          // in legacy qui chiedevamo canale: ora diamo per LinkedIn
+          setFlow(db, chatId, "ASK_CONTACT", { ...flowContext, channel: flowContext.channel || "LinkedIn" });
+          return tgSend(cfg, chatId, contactPrompt(flowContext.channel || "LinkedIn"));
         }
 
         if (/^no$/i.test(txt)) {
           return handleCommand({ cfg, db, chatId, user, parsed: { cmd: "/prossima", args: "" } });
         }
 
-        // correzioni libere: append e resta in FINAL
         const draft2 = (flowContext.finalDraft || "") + `\n\n[Nota utente: ${txt}]`;
         setFlow(db, chatId, "FINAL", { ...flowContext, finalDraft: draft2 });
         return tgSend(cfg, chatId, "Ricevuto. Vuoi confermare così? (OK) oppure scrivimi un’altra correzione.");
       }
 
-      // PICK_DRAFT
-if (flowState === "PICK_DRAFT") {
-  const pack = flowContext?.draftPack || {};
-  const drafts = Array.isArray(pack?.drafts) ? pack.drafts : [];
-  const queue = Array.isArray(flowContext.queue) ? flowContext.queue : [];
+      // PICK_DRAFT (LLM)
+      if (flowState === "PICK_DRAFT") {
+        const pack = flowContext?.draftPack || {};
+        const drafts = Array.isArray(pack?.drafts) ? pack.drafts : [];
+        const queue = Array.isArray(flowContext.queue) ? flowContext.queue : [];
+        const channel = flowContext.channel || "LinkedIn";
+        const enrich = flowContext.enrich || null;
 
-  if (/^no$/i.test(txt)) {
-    return handleCommand({ cfg, db, chatId, user, parsed: { cmd: "/prossima", args: "" } });
-  }
+        if (/^no$/i.test(txt)) {
+          return handleCommand({ cfg, db, chatId, user, parsed: { cmd: "/prossima", args: "" } });
+        }
 
-  if (/^rigenera$/i.test(txt)) {
-  try {
-    const newPack = await withTyping(cfg, chatId, () =>
-      draftOutboundWithLLM({
-        cfg,
-        company: {
-          name: flowContext.companyName,
-          website: flowContext.companyUrl,
-          analysis: flowContext.analysis,
-        },
-        channel: "LinkedIn",
-      })
-    );
+        if (/^rigenera$/i.test(txt)) {
+          try {
+            const newPack = await withTyping(cfg, chatId, () =>
+              draftOutboundWithLLM({
+                cfg,
+                company: {
+                  name: flowContext.companyName,
+                  website: flowContext.companyUrl,
+                  analysis: flowContext.analysis,
+                },
+                channel,
+                enrich,
+              })
+            );
 
-    setFlow(db, chatId, "PICK_DRAFT", { ...flowContext, queue, draftPack: newPack });
-    return tgSend(cfg, chatId, renderDraftChoices(newPack));
-  } catch (e) {
-    return tgSend(cfg, chatId, `Errore rigenerazione: ${e.message}`);
-  }
-}
+            setFlow(db, chatId, "PICK_DRAFT", { ...flowContext, queue, draftPack: newPack, enrich });
+            return tgSend(cfg, chatId, renderDraftChoices(newPack));
+          } catch (e) {
+            return tgSend(cfg, chatId, `Errore rigenerazione: ${e.message}`);
+          }
+        }
 
-  const pick = String(txt || "").trim();
-  const chosen = drafts.find((d) => d.id === pick);
-  if (!chosen) {
-    return tgSend(cfg, chatId, "Rispondi 1/2/3 oppure RIGENERA oppure NO.");
-  }
+        const pick = String(txt || "").trim();
+        const chosen = drafts.find((d) => d.id === pick);
+        if (!chosen) {
+          return tgSend(cfg, chatId, "Rispondi 1/2/3 oppure RIGENERA oppure NO.");
+        }
 
-  // porta avanti il flusso standard di conferma/salvataggio
-  setFlow(db, chatId, "ASK_CHANNEL", {
-    ...flowContext,
-    queue,
-    finalDraft: chosen.text,
-  });
+        setFlow(db, chatId, "ASK_CONTACT", {
+          ...flowContext,
+          queue,
+          finalDraft: chosen.text,
+          finalSubject: chosen.subject || null,
+          channel,
+        });
 
-  return tgSend(cfg, chatId, channelMenu());
-}
-
-      // ASK_CHANNEL
-      if (flowState === "ASK_CHANNEL") {
-        if (!/^[12]$/.test(txt)) return tgSend(cfg, chatId, "Rispondi 1 (LinkedIn) oppure 2 (Email).");
-        const channel = txt === "1" ? "LinkedIn" : "Email";
-        setFlow(db, chatId, "ASK_CONTACT", { ...flowContext, channel });
         return tgSend(cfg, chatId, contactPrompt(channel));
       }
 
-      // ASK_CONTACT
+      // ASK_CONTACT (final)
       if (flowState === "ASK_CONTACT") {
-        const channel = flowContext?.channel;
+        const channel = flowContext?.channel || "LinkedIn";
         const contact = String(txt || "").trim();
 
         if (!contact || contact.length < 4) {
           return tgSend(cfg, chatId, "Contatto non valido. Riprova.");
         }
 
-        // validazione leggera per evitare garbage
         if (channel === "Email" && !looksLikeEmail(contact)) {
           return tgSend(cfg, chatId, "Email non valida. Riprova (es: nome@azienda.it).");
         }
@@ -993,7 +1130,6 @@ if (flowState === "PICK_DRAFT") {
           return tgSend(cfg, chatId, "Per LinkedIn incolla URL oppure scrivi nome+cognome (min 6 caratteri).");
         }
 
-        // salva draft + channel + contact per /ok
         upsertUserPrefs({
           db,
           chatId,
@@ -1001,6 +1137,7 @@ if (flowState === "PICK_DRAFT") {
             lastDraftMessage: {
               companyName: flowContext.companyName,
               text: flowContext.finalDraft,
+              subject: flowContext.finalSubject || null,
               channel,
               contact,
             },

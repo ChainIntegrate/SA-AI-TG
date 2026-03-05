@@ -4,7 +4,7 @@ import { getUserPrefs, upsertUserPrefs } from "./state.js";
 
 /**
  * Cache colonne messages per evitare PRAGMA ad ogni insert/list.
- * { hasChannel: boolean, hasContact: boolean }
+ * { hasChannel: boolean, hasContact: boolean, hasSubject: boolean }
  */
 let _messagesColsCache = null;
 
@@ -17,10 +17,11 @@ function getMessagesCols(db) {
     _messagesColsCache = {
       hasChannel: names.has("channel"),
       hasContact: names.has("contact"),
+      hasSubject: names.has("subject"),
     };
   } catch {
     // se per qualsiasi motivo PRAGMA fallisse, fallback safe
-    _messagesColsCache = { hasChannel: false, hasContact: false };
+    _messagesColsCache = { hasChannel: false, hasContact: false, hasSubject: false };
   }
 
   return _messagesColsCache;
@@ -58,7 +59,7 @@ VALUES(?,?,?,?,?,?,?,?)
       lastDraftMessage: {
         companyName: company.name,
         text: company.messageDraft,
-        // channel qui è utile se vuoi già mostrarlo
+        subject: null, // ✅ nuovo: oggetto email se serve
         channel: channel || null,
         contact: null,
       },
@@ -114,10 +115,18 @@ export function addNote({ db, chatId, companyName, text }) {
 }
 
 /**
- * Ora supporta opzionalmente channel/contact (senza rompere DB vecchi).
- * Se la tabella messages non ha colonne channel/contact, salva solo text.
+ * Ora supporta opzionalmente channel/contact/subject (senza rompere DB vecchi).
+ * Se la tabella messages non ha colonne extra, salva solo text.
  */
-export function recordOutboundMessage({ db, chatId, companyName, text, channel = null, contact = null }) {
+export function recordOutboundMessage({
+  db,
+  chatId,
+  companyName,
+  text,
+  channel = null,
+  contact = null,
+  subject = null,
+}) {
   const row = db
     .prepare(
       `
@@ -134,55 +143,40 @@ ORDER BY d.id DESC LIMIT 1
 
   const cols = getMessagesCols(db);
 
-  // insert dinamico: se esistono le colonne, le usiamo; altrimenti fallback
-  if (cols.hasChannel && cols.hasContact) {
-    db.prepare(
-      `INSERT INTO messages(chat_id, deal_id, direction, text, channel, contact, created_at) VALUES(?,?,?,?,?,?,?)`
-    ).run(String(chatId), row.deal_id, "OUTBOUND", String(text), channel, contact, nowIso());
-    return true;
+  // costruisci INSERT dinamico in base alle colonne esistenti
+  const fields = ["chat_id", "deal_id", "direction", "text"];
+  const values = [String(chatId), row.deal_id, "OUTBOUND", String(text)];
+
+  if (cols.hasChannel) {
+    fields.push("channel");
+    values.push(channel);
+  }
+  if (cols.hasContact) {
+    fields.push("contact");
+    values.push(contact);
+  }
+  if (cols.hasSubject) {
+    fields.push("subject");
+    values.push(subject);
   }
 
-  if (cols.hasChannel && !cols.hasContact) {
-    db.prepare(`INSERT INTO messages(chat_id, deal_id, direction, text, channel, created_at) VALUES(?,?,?,?,?,?)`).run(
-      String(chatId),
-      row.deal_id,
-      "OUTBOUND",
-      String(text),
-      channel,
-      nowIso()
-    );
-    return true;
-  }
+  fields.push("created_at");
+  values.push(nowIso());
 
-  if (!cols.hasChannel && cols.hasContact) {
-    db.prepare(`INSERT INTO messages(chat_id, deal_id, direction, text, contact, created_at) VALUES(?,?,?,?,?,?)`).run(
-      String(chatId),
-      row.deal_id,
-      "OUTBOUND",
-      String(text),
-      contact,
-      nowIso()
-    );
-    return true;
-  }
+  const placeholders = fields.map(() => "?").join(",");
 
-  // fallback base (schema attuale tuo)
-  db.prepare(`INSERT INTO messages(chat_id, deal_id, direction, text, created_at) VALUES(?,?,?,?,?)`).run(
-    String(chatId),
-    row.deal_id,
-    "OUTBOUND",
-    String(text),
-    nowIso()
-  );
+  db.prepare(`INSERT INTO messages(${fields.join(",")}) VALUES(${placeholders})`).run(...values);
   return true;
 }
 
 /**
  * Lista pipeline "ricca": include canale, ruolo, prossimo followup,
- * e ultimo OUTBOUND con data + (se presenti) contact/channel.
+ * e ultimo OUTBOUND con data + (se presenti) contact/channel/subject.
  */
 export function listPipeline({ db, chatId }) {
-  // join sull’ultimo OUTBOUND per ogni deal
+  const cols = getMessagesCols(db);
+
+  // query compatibile: seleziona sempre i campi “virtuali” NULL se non esistono colonne
   const rows = db
     .prepare(
       `
@@ -196,10 +190,10 @@ SELECT
 
   m.created_at AS lastOutboundAt,
   m.text AS lastOutboundText,
-  -- se le colonne non esistono, SQLite darà errore: quindi facciamo query compatibile sotto
-  -- (vedi logica qui sotto)
-  NULL AS lastOutboundChannel,
-  NULL AS lastOutboundContact
+
+  ${cols.hasChannel ? "m.channel" : "NULL"} AS lastOutboundChannel,
+  ${cols.hasContact ? "m.contact" : "NULL"} AS lastOutboundContact,
+  ${cols.hasSubject ? "m.subject" : "NULL"} AS lastOutboundSubject
 
 FROM deals d
 JOIN companies c ON c.id=d.company_id
@@ -219,47 +213,6 @@ LIMIT 50
 `
     )
     .all(String(chatId), String(chatId));
-
-  // Se il DB ha colonne channel/contact su messages, rifacciamo query “estesa”
-  const cols = getMessagesCols(db);
-  if (cols.hasChannel || cols.hasContact) {
-    const rows2 = db
-      .prepare(
-        `
-SELECT
-  c.name AS companyName,
-  d.stage AS stage,
-  d.channel AS channel,
-  d.role_target AS roleTarget,
-  d.role_why AS roleWhy,
-  d.next_followup_at AS nextFollowupAt,
-
-  m.created_at AS lastOutboundAt,
-  m.text AS lastOutboundText,
-  ${cols.hasChannel ? "m.channel" : "NULL"} AS lastOutboundChannel,
-  ${cols.hasContact ? "m.contact" : "NULL"} AS lastOutboundContact
-
-FROM deals d
-JOIN companies c ON c.id=d.company_id
-
-LEFT JOIN messages m
-  ON m.id = (
-    SELECT m2.id
-    FROM messages m2
-    WHERE m2.deal_id = d.id AND m2.direction = 'OUTBOUND'
-    ORDER BY m2.id DESC
-    LIMIT 1
-  )
-
-WHERE d.chat_id=? AND c.chat_id=?
-ORDER BY d.id DESC
-LIMIT 50
-`
-      )
-      .all(String(chatId), String(chatId));
-
-    return rows2 || [];
-  }
 
   return rows || [];
 }
@@ -304,8 +257,8 @@ export function purgeForChat({ db, chatId, flags }) {
 
   const tx = db.transaction(() => {
     if (flags?.messages) q(db, `DELETE FROM messages WHERE chat_id=?`, [cid]);
-    if (flags?.notes)    q(db, `DELETE FROM notes    WHERE chat_id=?`, [cid]);
-    if (flags?.deals)    q(db, `DELETE FROM deals    WHERE chat_id=?`, [cid]);
+    if (flags?.notes) q(db, `DELETE FROM notes    WHERE chat_id=?`, [cid]);
+    if (flags?.deals) q(db, `DELETE FROM deals    WHERE chat_id=?`, [cid]);
     if (flags?.companies) q(db, `DELETE FROM companies WHERE chat_id=?`, [cid]);
   });
 
@@ -330,24 +283,16 @@ export function deleteCompanyCascade({ db, chatId, companyName }) {
   if (!c) return { ok: false, reason: "not_found" };
 
   const tx = db.transaction(() => {
-    // trova deals della company
     const deals = all(db, `SELECT id FROM deals WHERE chat_id=? AND company_id=?`, [cid, c.id]);
-    const dealIds = deals.map(d => d.id);
+    const dealIds = deals.map((d) => d.id);
 
-    // cancella messages per quei deals
     if (dealIds.length) {
-      // costruisci IN (?, ?, ...)
       const ph = dealIds.map(() => "?").join(",");
       q(db, `DELETE FROM messages WHERE chat_id=? AND deal_id IN (${ph})`, [cid, ...dealIds]);
     }
 
-    // cancella notes per company
     q(db, `DELETE FROM notes WHERE chat_id=? AND company_id=?`, [cid, c.id]);
-
-    // cancella deals
     q(db, `DELETE FROM deals WHERE chat_id=? AND company_id=?`, [cid, c.id]);
-
-    // cancella company
     q(db, `DELETE FROM companies WHERE chat_id=? AND id=?`, [cid, c.id]);
   });
 
@@ -363,13 +308,8 @@ export function pruneDealsKeepLastN({ db, chatId, keep = 50 }) {
   const k = Math.max(0, Number(keep) || 0);
 
   const tx = db.transaction(() => {
-    const keepIds = all(
-      db,
-      `SELECT id FROM deals WHERE chat_id=? ORDER BY id DESC LIMIT ?`,
-      [cid, k]
-    ).map(r => r.id);
+    const keepIds = all(db, `SELECT id FROM deals WHERE chat_id=? ORDER BY id DESC LIMIT ?`, [cid, k]).map((r) => r.id);
 
-    // se nulla da tenere, purge all deals+messages (non companies)
     if (!keepIds.length) {
       q(db, `DELETE FROM messages WHERE chat_id=?`, [cid]);
       q(db, `DELETE FROM deals WHERE chat_id=?`, [cid]);
@@ -377,18 +317,9 @@ export function pruneDealsKeepLastN({ db, chatId, keep = 50 }) {
     }
 
     const ph = keepIds.map(() => "?").join(",");
-    // cancella messages dei deals NON in keep
-    q(
-      db,
-      `DELETE FROM messages WHERE chat_id=? AND deal_id NOT IN (${ph})`,
-      [cid, ...keepIds]
-    );
-    // cancella deals NON in keep
-    q(
-      db,
-      `DELETE FROM deals WHERE chat_id=? AND id NOT IN (${ph})`,
-      [cid, ...keepIds]
-    );
+
+    q(db, `DELETE FROM messages WHERE chat_id=? AND deal_id NOT IN (${ph})`, [cid, ...keepIds]);
+    q(db, `DELETE FROM deals WHERE chat_id=? AND id NOT IN (${ph})`, [cid, ...keepIds]);
   });
 
   tx();

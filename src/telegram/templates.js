@@ -79,3 +79,33 @@ function splitTelegram(s, maxLen) {
   if (buf) out.push(buf);
   return out;
 }
+
+// --- NEW helpers: send single message (return message_id) + edit ---
+
+export async function tgSendOne(cfg, chatId, text, opts = {}) {
+  const j = await tgApiCall(cfg, "sendMessage", {
+    chat_id: chatId,
+    text: String(text || ""),
+    disable_web_page_preview: true,
+    ...opts,
+  });
+  // Telegram returns { ok:true, result:{ message_id, ... } }
+  return j?.result || null;
+}
+
+export async function tgEdit(cfg, chatId, messageId, text, opts = {}) {
+  return tgApiCall(cfg, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: String(text || ""),
+    disable_web_page_preview: true,
+    ...opts,
+  });
+}
+
+export async function tgDelete(cfg, chatId, messageId) {
+  return tgApiCall(cfg, "deleteMessage", {
+    chat_id: chatId,
+    message_id: messageId,
+  });
+}

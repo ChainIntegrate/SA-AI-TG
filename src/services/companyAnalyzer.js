@@ -109,14 +109,13 @@ VALUES(?,?,?,?,?,?,?,?,?,?)
     whyNow: analysis.why_now,
     icebreaker: analysis.icebreaker_line,
 
-    // ✅ NEW: contact hint for Telegram UI
+    // NEW: contact hint
     contactHint,
 
-      // ✅ NEW: raw evidence snippets (for rich Telegram output)
+    // NEW: raw evidence snippets (for rich Telegram output)
     evidenceItems: Array.isArray(searchPack?.items) ? searchPack.items : [],
     evidenceQuery: searchPack?.query || null,
     sourceUrls: Array.isArray(searchPack?.sourceUrls) ? searchPack.sourceUrls : [],
-    
   };
 }
 
@@ -260,7 +259,6 @@ async function buildSearchPack({ cfg, url, baseName }) {
 async function buildContactSearchPack({ cfg, url, baseName }) {
   const host = hostOf(url);
 
-  // query mirata: contatti/email + linkedin. (meglio con site:)
   const q = [
     `"${baseName}"`,
     host ? `site:${host}` : "",
@@ -354,10 +352,8 @@ function dedupeUrls(urls) {
 
 /**
  * Estrazione deterministica (prima dell'LLM) da snippet/URL:
- * - Email (molto frequente)
- * - LinkedIn company/person se presente in URL o snippet
- *
- * Nota: ritorna anche evidence_ref quando possibile (#n).
+ * - Email
+ * - LinkedIn URL (company/person)
  */
 function extractContactHintHeuristic(searchPack) {
   const items = Array.isArray(searchPack?.items) ? searchPack.items : [];
@@ -380,7 +376,7 @@ function extractContactHintHeuristic(searchPack) {
     }
   }
 
-  // 2) linkedin url (company > person)
+  // 2) linkedin url
   for (let i = 0; i < items.length; i++) {
     const text = `${items[i].title}\n${items[i].snippet}\n${items[i].url}`;
     const li = findFirstLinkedInUrl(text);
@@ -409,9 +405,9 @@ function findFirstEmail(text) {
 
 function findFirstLinkedInUrl(text) {
   const t = String(text || "");
-  // prende URL linkedin presenti in testo, anche senza schema
-  const m = t.match(/https?:\/\/(www\.)?linkedin\.com\/[^\s)"']+/i)
-    || t.match(/(www\.)?linkedin\.com\/[^\s)"']+/i);
+  const m =
+    t.match(/https?:\/\/(www\.)?linkedin\.com\/[^\s)"']+/i) ||
+    t.match(/(www\.)?linkedin\.com\/[^\s)"']+/i);
   if (!m) return null;
   let u = m[0];
   if (!/^https?:\/\//i.test(u)) u = `https://${u.replace(/^www\./i, "www.")}`;
@@ -432,11 +428,15 @@ function normalizeContactHint(h) {
     confidence: typeof h.confidence === "number" ? h.confidence : 0,
   };
 
-  // coerenza minima
   if (out.channel === "EMAIL" && !out.email) out.channel = "NONE";
   if (out.channel === "LINKEDIN" && !out.url) out.channel = "NONE";
   if (out.channel === "NONE") {
-    out.name = null; out.role = null; out.url = null; out.email = null; out.evidence_ref = null; out.confidence = 0;
+    out.name = null;
+    out.role = null;
+    out.url = null;
+    out.email = null;
+    out.evidence_ref = null;
+    out.confidence = 0;
   }
   return out;
 }
@@ -461,7 +461,6 @@ async function analyzeWithLLM({ cfg, prefs, baseName, url, searchPack, heuristic
       icebreaker_line: { type: "string" },
       linkedin_draft: { type: "string" },
 
-      // ✅ NEW: contact hint (must be evidence-backed)
       contact_hint: {
         type: "object",
         additionalProperties: false,
@@ -576,30 +575,28 @@ ${searchPack.evidenceText}
 
   const a = out.data || {};
 
-  // --- Guard-rail: se evidence_map è povera, abbassa confidence ---
   if (!Array.isArray(a.evidence_map) || a.evidence_map.length < 2) {
     a.evidence_map = Array.isArray(a.evidence_map) ? a.evidence_map : [];
     a.confidence = { company_match: 40, sector: 40, size_est: 30 };
   }
 
-  // --- Guard-rail: contact_hint coerente ---
   a.contact_hint = normalizeContactHint(a.contact_hint) || { channel: "NONE", confidence: 0, evidence_ref: null };
 
-  // --- Guard-rail: evita placeholder nel draft ---
   const badPlaceholders = /\[(nome|tuo nome|name)\]|\{(nome|name)\}|<nome>/i;
   if (badPlaceholders.test(a.linkedin_draft || "")) {
     a.linkedin_draft = safeTruncate(
-      normalizeWhitespace(`
+      normalizeWhitespace(
+        `
 Buongiorno, sto contattando aziende in ambito qualità/tracciabilità.
 Dal vostro sito emerge: ${a.evidence_map?.[0]?.claim || "attività in ambito manifatturiero"}.
 Se ha senso, mi piacerebbe capire come gestite oggi tracciabilità e versioni documentali nei processi.
 Possiamo sentirci 10-15 minuti questa settimana?
-`.trim()),
+`.trim()
+      ),
       1200
     );
   }
 
-  // Normalizzazioni / clip
   a.linkedin_draft = safeTruncate(normalizeWhitespace(String(a.linkedin_draft || "")), 1200);
   a.entry_angle = safeTruncate(normalizeWhitespace(String(a.entry_angle || "")), 500);
   a.role_why = safeTruncate(normalizeWhitespace(String(a.role_why || "")), 500);
@@ -627,7 +624,9 @@ Possiamo sentirci 10-15 minuti questa settimana?
   return a;
 }
 
-export async function draftOutboundWithLLM({ cfg, company, channel = "LinkedIn" }) {
+/* --------------------------- OUTBOUND DRAFT --------------------------- */
+
+export async function draftOutboundWithLLM({ cfg, company, channel = "LinkedIn", enrich = null }) {
   if (!company?.analysis) throw new Error("Missing company.analysis for drafting");
 
   const schema = {
@@ -644,20 +643,32 @@ export async function draftOutboundWithLLM({ cfg, company, channel = "LinkedIn" 
           properties: {
             id: { type: "string", enum: ["1", "2", "3"] },
             angle: { type: "string" }, // audit / docs / verify
-            tone: { type: "string" },  // diretto / bilanciato / formale
-            text: { type: "string" }   // 5-9 righe
+            tone: { type: "string" }, // diretto / bilanciato / formale
+            subject: { type: ["string", "null"] }, // ✅ Email only, LinkedIn => null
+            text: { type: "string" }, // 5-9 righe
           },
-          required: ["id", "angle", "tone", "text"]
-        }
+          required: ["id", "angle", "tone", "subject", "text"],
+        },
       },
       suggested_channel: { type: "string", enum: ["LinkedIn", "Email"] },
-      followup_question: { type: "string" }
+      followup_question: { type: "string" },
     },
-    required: ["drafts", "suggested_channel", "followup_question"]
+    required: ["drafts", "suggested_channel", "followup_question"],
   };
 
   const a = company.analysis;
   const ev = Array.isArray(a.evidence_map) ? a.evidence_map : [];
+
+  const enr = normalizeEnrich(enrich);
+
+  const constraints = parseConstraintFlags(enr.constraints);
+
+  const cta = enr.cta || "call_15";
+  const pain = enr.pain || "docs";
+  const proof = enr.proof || "zero_change";
+  const hook = enr.hook || "";
+
+  const maxChars = constraints.max500 ? 500 : channel === "LinkedIn" ? 900 : 2000;
 
   const system = `
 Sei una sales assistant B2B per ChainIntegrate (qualità/tracciabilità).
@@ -667,18 +678,46 @@ REGOLE DURE:
 2) Vietato "blockchain" nel primo messaggio.
 3) Vietati placeholder (es: [Nome], <azienda>, ecc.).
 4) 5-9 righe max, professionale, non spam.
-5) Chiudi con CTA: call 10-15 minuti.
+5) Chiudi con CTA coerente con CTA_MODE.
+6) Se CHANNEL=Email: ogni bozza DEVE avere subject (max 70 caratteri). Se CHANNEL=LinkedIn: subject=null.
+7) QR: puoi citarlo SOLO se serve e senza insistere (max 1 volta).
 
-Genera 2-3 varianti con angoli diversi:
-- audit/tempi e attriti
-- versioni documenti / errori / duplicazioni
-- verifica per clienti esteri / accesso verificabile (QR solo se serve, senza insistere)
+VINCOLI ATTIVI:
+- NO_BLOCKCHAIN: ${constraints.noBlockchain ? "SI" : "NO"}
+- NO_NFT: ${constraints.noNFT ? "SI" : "NO"}
+- NO_PRICING: ${constraints.noPricing ? "SI" : "NO"}
+- MAX_500_CHARS: ${constraints.max500 ? "SI" : "NO"}
+- SUPER_FORMAL: ${constraints.superFormal ? "SI" : "NO"}
+
+CTA_MODE:
+- call_15: proponi call 10-15 min
+- find_decider: chiedi a chi conviene parlarne internamente
+- get_info: fai una domanda operativa su come gestiscono oggi
+- demo: proponi mini-demo / esempio pratico
+
+PAIN_MODE:
+- audit: audit/ISO, tempi, attriti
+- docs: versioni documenti, duplicati, errori
+- export_verify: clienti esteri, verifica rapida e fiducia
+- trace_ncr: tracciabilità lotti, NCR, reclami
+
+PROOF_MODE:
+- case_real: riferimento a esperienza/caso reale (senza dettagli inventati)
+- qr_demo: offri demo con QR verificabile (senza buzzword)
+- zero_change: “si integra senza stravolgere l’ERP”
+- iso_mindset: “approccio qualità/ISO, pragmatismo operativo”
 `.trim();
 
   const input = `
 CHANNEL: ${channel}
 COMPANY: ${company.name}
 WEBSITE: ${company.website}
+
+CTA_MODE: ${cta}
+PAIN_MODE: ${pain}
+PROOF_MODE: ${proof}
+HOOK (optional): ${hook ? hook : "(none)"}
+MAX_CHARS: ${maxChars}
 
 EVIDENCE_MAP (usa solo questi claim):
 ${ev.map((x, i) => `- (${x.evidence_ref || "#" + (i + 1)}) ${x.claim}`).join("\n")}
@@ -689,21 +728,135 @@ ${ev.map((x, i) => `- (${x.evidence_ref || "#" + (i + 1)}) ${x.claim}`).join("\n
     system,
     schema,
     model: cfg.LLM_MODEL || undefined,
-    temperature: 0.4,
-    maxOutputTokens: 700,
-    metadata: { feature: "outbound_draft", company: company.name, channel }
+    temperature: 0.35,
+    maxOutputTokens: 800,
+    metadata: { feature: "outbound_draft", company: company.name, channel, cta, pain, proof },
   });
 
-  // normalizzazione minima
   const data = out.data || {};
-  data.drafts = (Array.isArray(data.drafts) ? data.drafts : []).slice(0, 3).map((d, idx) => ({
-    id: String(d?.id || String(idx + 1)),
-    angle: String(d?.angle || "").trim().slice(0, 80),
-    tone: String(d?.tone || "").trim().slice(0, 80),
-    text: String(d?.text || "").trim().slice(0, 1400),
-  }));
+  data.drafts = (Array.isArray(data.drafts) ? data.drafts : [])
+    .slice(0, 3)
+    .map((d, idx) => {
+      let text = String(d?.text || "").trim();
+      let subject = d?.subject === null ? null : String(d?.subject || "").trim();
+
+      text = stripPlaceholders(text);
+
+      // hard constraints scrubbing
+      if (constraints.noBlockchain) text = scrubWord(text, "blockchain");
+      if (constraints.noNFT) text = scrubWord(text, "nft");
+      if (constraints.noPricing) text = scrubPricingHints(text);
+
+      if (maxChars && text.length > maxChars) text = text.slice(0, maxChars - 1).trimEnd() + "…";
+
+      if (constraints.superFormal) text = enforceFormalItalian(text);
+
+      // subject rules
+      if (channel === "LinkedIn") {
+        subject = null;
+      } else {
+        // Email: subject required
+        if (!subject) {
+          subject = buildSubjectFallback(company, ev, pain);
+        }
+        subject = safeTruncate(normalizeWhitespace(subject), 70);
+      }
+
+      return {
+        id: String(d?.id || String(idx + 1)),
+        angle: String(d?.angle || "").trim().slice(0, 80),
+        tone: String(d?.tone || "").trim().slice(0, 80),
+        subject,
+        text: text.slice(0, 1800),
+      };
+    });
+
+  data.followup_question = normalizeFollowupQuestion(String(data.followup_question || ""), cta);
+  if (constraints.max500) data.suggested_channel = "LinkedIn";
 
   return data;
+}
+
+/* ---------------------- enrich helpers (new) ---------------------- */
+
+function normalizeEnrich(enrich) {
+  if (!enrich || typeof enrich !== "object") return {};
+  return {
+    cta: enrich.cta ? String(enrich.cta).trim() : "",
+    pain: enrich.pain ? String(enrich.pain).trim() : "",
+    proof: enrich.proof ? String(enrich.proof).trim() : "",
+    constraints: enrich.constraints ? String(enrich.constraints).trim() : "",
+    hook: enrich.hook ? String(enrich.hook).trim() : "",
+  };
+}
+
+function parseConstraintFlags(s) {
+  const t = String(s || "").toUpperCase();
+  return {
+    noBlockchain: t.includes("A"),
+    noNFT: t.includes("B"),
+    noPricing: t.includes("C"),
+    max500: t.includes("D"),
+    superFormal: t.includes("E"),
+  };
+}
+
+function stripPlaceholders(text) {
+  return String(text || "")
+    .replace(/\[(.*?)\]|\<(.*?)\>|\{(.*?)\}/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function scrubWord(text, word) {
+  const re = new RegExp(`\\b${word}\\b`, "ig");
+  return String(text || "").replace(re, "").replace(/\s{2,}/g, " ").trim();
+}
+
+function scrubPricingHints(text) {
+  return String(text || "")
+    .replace(/\b(prezzo|costo|tariffa|preventivo|offerta economica|quotazione)\b/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function enforceFormalItalian(text) {
+  let t = String(text || "");
+  t = t.replace(/\bCiao\b/gi, "Buongiorno");
+  t = t.replace(/\bti\b/gi, "Le");
+  t = t.replace(/\btuo\b/gi, "Suo");
+  t = t.replace(/\bti va\b/gi, "Le sarebbe comodo");
+  return t;
+}
+
+function normalizeFollowupQuestion(q, cta) {
+  const qq = String(q || "").trim();
+  if (qq.length >= 8) return qq;
+
+  if (cta === "find_decider") return "A chi conviene parlarne internamente (Qualità / Operations / Supply Chain)?";
+  if (cta === "get_info") return "Oggi come gestite versioni documentali e tracciabilità tra fornitori/produzione?";
+  if (cta === "demo") return "Preferisce una mini-demo (5 minuti) o un esempio concreto via messaggio?";
+  return "Va bene una call di 10-15 minuti questa settimana?";
+}
+
+function buildSubjectFallback(company, ev, pain) {
+  const base = company?.name ? `Info ${company.name}` : "Info";
+  const hint =
+    pain === "audit"
+      ? "ridurre attriti audit"
+      : pain === "docs"
+      ? "versioni documenti qualità"
+      : pain === "export_verify"
+      ? "verifica rapida per clienti"
+      : pain === "trace_ncr"
+      ? "tracciabilità lotti / NCR"
+      : "qualità e tracciabilità";
+
+  // usa un claim se disponibile, senza inventare
+  const claim = Array.isArray(ev) && ev[0]?.claim ? safeTruncate(normalizeWhitespace(String(ev[0].claim)), 42) : "";
+  const tail = claim ? ` — ${claim}` : "";
+
+  return safeTruncate(`${base}: ${hint}${tail}`, 70);
 }
 
 function addCompanyFallback({ cfg, db, chatId, url, prefs, baseName }) {
@@ -732,18 +885,8 @@ INSERT INTO companies(chat_id, name, website, sector, country, size_est, signals
 VALUES(?,?,?,?,?,?,?,?,?,?)
 `
     )
-    .run(
-      String(chatId),
-      name,
-      url,
-      sector,
-      "Italia",
-      sizeEst,
-      JSON.stringify(signals),
-      JSON.stringify([url]),
-      null,
-      nowIso()
-    ).lastInsertRowid;
+    .run(String(chatId), name, url, sector, "Italia", sizeEst, JSON.stringify(signals), JSON.stringify([url]), null, nowIso())
+    .lastInsertRowid;
 
   const company = db.prepare(`SELECT * FROM companies WHERE id=?`).get(companyId);
 
